@@ -1,4 +1,5 @@
 import os
+import tempfile
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -98,7 +99,10 @@ async def upload_asset(
     await _get_project_or_404(project_id, current_user.id, db)
 
     # ---- 安全校验 ----
-    filename = (file.filename or "").strip()
+    # T0：文件名只用于展示，不再参与存储路径；路径穿越由
+    #      "不含客户端字符的对象名 + 存储层越界校验" 双重封堵。
+    raw_name = (file.filename or "").strip().replace("\\", "/")
+    filename = os.path.basename(raw_name)[:200] or "untitled"
     ext = os.path.splitext(filename)[1].lower()
     content_type = (file.content_type or "").lower()
 
@@ -113,31 +117,49 @@ async def upload_asset(
             detail=f"不支持的文件类型: {content_type}",
         )
 
+    # T0：边写盘边计数，超限立即中断。
+    # 旧实现先 await file.read() 把整包读进内存再比较大小，
+    # 500MB 上限在"读完之后"才生效，并发上传可把进程内存打爆。
     max_size = settings.UPLOAD_MAX_SIZE_MB * 1024 * 1024
-    content = await file.read()
-    if len(content) > max_size:
-        raise HTTPException(
-            status_code=413,
-            detail=f"文件过大，最大允许 {settings.UPLOAD_MAX_SIZE_MB}MB",
-        )
-    if not content:
-        raise HTTPException(status_code=400, detail="文件内容为空")
+    tmp_dir = os.path.join(settings.STORAGE_LOCAL_PATH, ".tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="upload_", suffix=ext, dir=tmp_dir)
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"文件过大，最大允许 {settings.UPLOAD_MAX_SIZE_MB}MB",
+                    )
+                out.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="文件内容为空")
 
-    # 上传到存储
-    object_name = f"{project_id}/{uuid.uuid4()}_{filename}"
-    url = await storage_service.upload_file(
-        object_name=object_name,
-        data=content,
-        content_type=content_type or "application/octet-stream",
-        size=len(content),
-    )
+        object_name = f"{project_id}/{uuid.uuid4().hex}{ext}"
+        url = await storage_service.upload_from_path(
+            object_name=object_name,
+            src_path=tmp_path,
+            content_type=content_type or "application/octet-stream",
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     asset = Asset(
         project_id=project_id,
         name=filename or "untitled",
         type=_determine_asset_type(content_type),
         mime_type=content_type,
-        size=len(content),
+        size=total,
         url=url,
         tags=[t.strip() for t in tags.split(",") if t.strip()],
     )

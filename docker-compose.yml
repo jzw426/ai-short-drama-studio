@@ -27,7 +27,8 @@ services:
       - "8000:8000"
     environment:
       - DEBUG=false
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      # T0：不再提供占位默认值；未设置时 compose 直接报错，而不是带公开密钥启动
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set in .env (python -c "import secrets; print(secrets.token_hex(32))")}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}
@@ -74,6 +75,8 @@ services:
     command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
     environment:
       - DEBUG=false
+      # T0：worker 同样要读 settings，缺 SECRET_KEY 会在 import 阶段拒启
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set in .env}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}

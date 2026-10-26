@@ -26,7 +26,10 @@ async def lifespan(app: FastAPI):
     # 启动时：SQLite 模式下自动创建表
     if settings.DATABASE_TYPE == "sqlite":
         os.makedirs(os.path.dirname(settings.DATABASE_PATH) or ".", exist_ok=True)
-        from app.models import project, script, storyboard, character, asset, ai_usage  # noqa: F401
+        # T0：显式导入 user，避免 create_all 依赖 deps 的副作用导入
+        from app.models import (  # noqa: F401
+            project, script, storyboard, character, asset, ai_usage, user,
+        )
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         print(f"[Startup] SQLite 数据库已就绪: {settings.DATABASE_PATH}")
