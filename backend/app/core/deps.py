@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
 from app.core.database import get_db
-from app.core.security import decode_access_token
+from app.core.security import decode_token_claims
 from app.models.user import User
 
 # 与 auth.py 保持一致
@@ -25,13 +25,19 @@ async def _resolve_user(
 
     if not token:
         return None
-    user_id = decode_access_token(token)
+    claims = decode_token_claims(token)
+    if not claims:
+        return None
+    user_id = claims.get("sub")
     if not user_id:
         return None
 
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
+        return None
+    # 会话代际校验：用户登出/改密后旧票立即失效（比黑名单省一张表、无需清理）
+    if int(claims.get("ver", 0) or 0) != int(user.token_version or 0):
         return None
     return user
 

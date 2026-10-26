@@ -35,21 +35,39 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def create_access_token(user_id: str, expires_minutes: int = 60 * 24 * 7) -> str:
-    """签发 JWT，默认有效期 7 天"""
+TOKEN_TTL_MINUTES = 60 * 24 * 7
+
+
+def create_access_token(
+    user_id: str,
+    *,
+    token_version: int = 0,
+    expires_minutes: int = TOKEN_TTL_MINUTES,
+) -> str:
+    """签发 JWT，默认有效期 7 天。
+
+    `ver` 是用户的会话代际：校验时与 users.token_version 比对，
+    用户在别处登出/改密把它 +1，这张票立刻作废（无需黑名单表、无需清理过期项）。
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
+        "ver": int(token_version or 0),
         "iat": now,
         "exp": now + timedelta(minutes=expires_minutes),
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
 
 
-def decode_access_token(token: str) -> Optional[str]:
-    """解析 JWT，返回 user_id；无效或过期返回 None"""
+def decode_token_claims(token: str) -> Optional[dict]:
+    """解析 JWT，返回完整 claim；无效或过期返回 None"""
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-        return payload.get("sub")
+        return jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
     except jwt.PyJWTError:
         return None
+
+
+def decode_access_token(token: str) -> Optional[str]:
+    """解析 JWT，返回 user_id；无效或过期返回 None（不校验会话代际）"""
+    claims = decode_token_claims(token)
+    return claims.get("sub") if claims else None

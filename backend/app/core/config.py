@@ -238,6 +238,8 @@ class Settings(BaseSettings):
     # 同一 "IP+用户名" 连续失败 LOGIN_MAX_FAILURES 次后锁定 LOGIN_LOCKOUT_SECONDS 秒。
     LOGIN_MAX_FAILURES: int = 5
     LOGIN_LOCKOUT_SECONDS: int = 300
+    # 登录限流后端：auto（Redis 可达则用 Redis，否则进程内）/ redis（不可用即报错）/ memory
+    RATE_LIMIT_BACKEND: str = "auto"
 
     # FFmpeg
     FFMPEG_PATH: str = "ffmpeg"

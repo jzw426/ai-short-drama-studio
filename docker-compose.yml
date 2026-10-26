@@ -8,8 +8,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_BASE_URL=http://backend:8000/api/v1
-      - NEXT_PUBLIC_MINIO_URL=http://minio:9000
+      # 浏览器解析不到 compose 服务名：这两个值会被打进前端 bundle，
+      # 必须是"用户浏览器能访问到"的地址，不是容器内网地址。
+      - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
+      - NEXT_PUBLIC_MINIO_URL=${NEXT_PUBLIC_MINIO_URL:-http://localhost:9000}
     depends_on:
       backend:
         condition: service_healthy
@@ -24,11 +26,14 @@ services:
       dockerfile: docker/Dockerfile.backend
     container_name: ai-drama-backend
     ports:
-      - "8000:8000"
+      # 只绑本机；对公网暴露应走反向代理（TLS + HSTS），不要直接开 8000
+      - "127.0.0.1:8000:8000"
     environment:
       - DEBUG=false
       # T0：不再提供占位默认值；未设置时 compose 直接报错，而不是带公开密钥启动
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set in .env (python -c "import secrets; print(secrets.token_hex(32))")}
+      # M1b：原来没设这个，容器内一直在用 SQLite（数据随容器重建蒸发）
+      - DATABASE_TYPE=postgres
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}
@@ -62,6 +67,12 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+    # 先跑迁移再起服务：原来容器里靠 create_all 建表，列变更永远不生效
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"]
+    volumes:
+      # backend 与 worker 必须共享 uploads：worker 渲染产物写到本地存储，
+      # backend 的 /uploads 端点要能读到同一份文件。原来各写各的，产物永远 404。
+      - uploads:/app/data/uploads
     networks:
       - ai-drama-net
     restart: unless-stopped
@@ -77,6 +88,7 @@ services:
       - DEBUG=false
       # T0：worker 同样要读 settings，缺 SECRET_KEY 会在 import 阶段拒启
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set in .env}
+      - DATABASE_TYPE=postgres
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}
@@ -104,6 +116,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    volumes:
+      - uploads:/app/data/uploads
     networks:
       - ai-drama-net
     restart: unless-stopped
@@ -117,7 +131,7 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -134,7 +148,7 @@ services:
     image: redis:7-alpine
     container_name: ai-drama-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -155,8 +169,8 @@ services:
       - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
       - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -170,6 +184,8 @@ services:
 
 volumes:
   pgdata:
+    driver: local
+  uploads:
     driver: local
   redis-data:
     driver: local

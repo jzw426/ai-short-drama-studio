@@ -32,6 +32,8 @@ class RenderConfigSchema(BaseModel):
     fps: int = 24
     visual_style: str = "电影级（Cinematic）"
     add_subtitles: bool = True
+    # 字幕文本来源：description=镜头画面描述（历史行为，语义上不准确）/ label=镜头标签 / none=不烧字幕
+    subtitle_source: str = "description"
     add_bgm: bool = True
     bgm_source: Optional[str] = None
     quality: str = "high"
@@ -41,6 +43,9 @@ class RenderConfigSchema(BaseModel):
 class RenderSubmitRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     config: RenderConfigSchema = Field(default_factory=RenderConfigSchema)
+    # 幂等键：前端为同一次"点击渲染"生成一个 UUID，重试/双击都复用同一个值，
+    # 服务端据此返回已存在的任务而不是再排一次队（每次重排都是真金白银的 AI 调用）
+    idempotency_key: Optional[str] = Field(default=None, max_length=100)
 
 
 class RenderTaskResponse(BaseModel):
@@ -56,6 +61,7 @@ class RenderTaskResponse(BaseModel):
     end_time: Optional[datetime]
     duration: Optional[float]
     created_at: datetime
+    cancel_requested: bool = False
 
     class Config:
         from_attributes = True

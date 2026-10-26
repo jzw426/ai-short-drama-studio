@@ -1,5 +1,6 @@
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
 
@@ -13,6 +14,16 @@ from app.models.user import User
 from app.schemas.asset import RenderSubmitRequest, RenderTaskResponse, RenderStatusResponse
 
 router = APIRouter(tags=["Render"])
+
+# 这些状态表示"任务已在跑且不该再排一次队"
+_ACTIVE_STATUSES = ("queued", "processing", "completed")
+
+
+def _task_response(task: RenderTask) -> RenderTaskResponse:
+    """统一出口：库里存规范 URL，响应时才签名（M1 媒体受控）。"""
+    resp = RenderTaskResponse.model_validate(task)
+    resp.output_url = sign_media_url(resp.output_url)
+    return resp
 
 
 async def _get_project_or_404(
@@ -52,19 +63,38 @@ async def _get_owned_task_or_404(
 async def submit_render_task(
     project_id: str,
     data: RenderSubmitRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """提交渲染任务"""
+    """提交渲染任务（支持幂等键，重复提交不会重复扣 AI 费用）"""
     await _get_project_or_404(project_id, current_user.id, db)
 
-    # 创建渲染任务记录
+    # 幂等：前端为一次点击生成一个 key，双击/重试/网络重发都落回同一个任务。
+    # 原实现没有幂等，一次卡顿用户点三下就排三次队，AI 视频按次计费，直接三倍成本。
+    if data.idempotency_key:
+        existing = (
+            await db.execute(
+                select(RenderTask).where(
+                    RenderTask.project_id == project_id,
+                    RenderTask.idempotency_key == data.idempotency_key,
+                    RenderTask.status.in_(_ACTIVE_STATUSES),
+                )
+            )
+        ).scalars().first()
+        if existing:
+            response.status_code = 200
+            return _task_response(existing)
+
     render_task = RenderTask(
         project_id=project_id,
         name=data.name,
         status="queued",
         progress=0.0,
         config=data.config.model_dump(),
+        idempotency_key=data.idempotency_key,
+        attempt=0,
+        checkpoint={},
     )
     db.add(render_task)
     await db.flush()
@@ -85,7 +115,7 @@ async def submit_render_task(
 
     await db.flush()
     await db.refresh(render_task)
-    return render_task
+    return _task_response(render_task)
 
 
 @router.get("/render/{task_id}/status", response_model=RenderStatusResponse)
@@ -113,18 +143,13 @@ async def list_render_tasks(
     current_user: User = Depends(get_current_user),
 ):
     """获取项目的所有渲染任务"""
-    from sqlalchemy import select
-
     await _get_project_or_404(project_id, current_user.id, db)
     result = await db.execute(
         select(RenderTask)
         .where(RenderTask.project_id == project_id)
         .order_by(RenderTask.created_at.desc())
     )
-    tasks = [RenderTaskResponse.model_validate(t) for t in result.scalars().all()]
-    for t in tasks:
-        t.output_url = sign_media_url(t.output_url)
-    return tasks
+    return [_task_response(t) for t in result.scalars().all()]
 
 
 @router.post("/render/{task_id}/cancel", response_model=RenderStatusResponse)
@@ -133,24 +158,31 @@ async def cancel_render_task(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """取消渲染任务"""
-    from celery.result import AsyncResult
+    """取消渲染任务。
 
+    先写协作式标志（worker 在每个可中断点读它并主动退出），再 revoke Celery。
+    原实现只 revoke：正在跑的 AI 生成不会中断，钱继续烧，而且 worker 随后
+    还会把状态改回 processing/completed。
+    """
     task = await _get_owned_task_or_404(task_id, current_user.id, db)
 
     if task.status not in ("queued", "processing"):
         raise HTTPException(status_code=400, detail="只能取消排队中或处理中的任务")
 
-    # 取消 Celery 任务（使用真实 celery task id，而非数据库记录 ID）
+    task.cancel_requested = True
+    task.status = "cancelled"
+    task.error_message = "用户取消"
+    task.end_time = task.end_time or task.created_at
+    await db.flush()
+
     if task.celery_task_id:
         try:
+            from celery.result import AsyncResult
+
             AsyncResult(task.celery_task_id).revoke(terminate=True)
         except Exception as e:
-            print(f"[WARNING] Celery 取消失败: {e}")
+            print(f"[WARNING] Celery revoke 失败（协作式标志仍会生效）: {e}")
 
-    task.status = "failed"
-    task.error_message = "用户取消"
-    await db.flush()
     await db.refresh(task)
 
     return RenderStatusResponse(

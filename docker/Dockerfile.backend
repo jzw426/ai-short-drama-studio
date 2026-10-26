@@ -48,8 +48,10 @@ RUN groupadd --system --gid 1001 appuser && \
 # 复制应用代码
 COPY backend/ .
 
-# 确保权限正确
-RUN chown -R appuser:appuser /app
+# 本地存储目录必须先存在且属于 appuser：
+# 命名卷首次挂载到非空目录时会继承该目录的属主，否则 worker 写不了渲染产物
+RUN mkdir -p /app/data/uploads && \
+    chown -R appuser:appuser /app
 
 USER appuser
 
