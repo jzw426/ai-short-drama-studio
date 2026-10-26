@@ -1,0 +1,98 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+
+# Build output
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+logs/
+*.log
+
+# MinIO data
+minio-data/
+
+# PostgreSQL data
+pgdata/
+
+# Redis data
+redis-data/
+
+# Media uploads
+uploads/
+media/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Temporary
+tmp/
+temp/
+
+# Misplaced Anaconda copy
+Anaconda3*/
+
+# ---- T0 基线补充（2026-10-26，乙方接管固化）----
+# 交付物卫生：历史垃圾与运行时产物不得进入版本库
+node_modules_old/
+.pytest_cache/
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+*.bak
+/*.docx
+backend/uvicorn_*.log

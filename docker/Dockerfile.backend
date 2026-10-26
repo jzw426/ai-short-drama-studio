@@ -1,0 +1,62 @@
+# ===== 构建阶段 =====
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# 更换为国内镜像源（清华源）
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+
+# 安装系统依赖（FFmpeg 等）- 最小化安装以加速
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制依赖文件并安装（使用清华源）
+COPY backend/requirements.txt .
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ===== 运行阶段 =====
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 更换为国内镜像源
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+
+# 安装运行时系统依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从构建阶段复制 Python 包
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# 创建非 root 用户
+RUN groupadd --system --gid 1001 appuser && \
+    useradd --system --uid 1001 --gid appuser appuser
+
+# 复制应用代码
+COPY backend/ .
+
+# 确保权限正确
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8000
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

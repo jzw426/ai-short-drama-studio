@@ -1,0 +1,178 @@
+services:
+  # ============ Frontend (Next.js) ============
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: ai-drama-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=http://backend:8000/api/v1
+      - NEXT_PUBLIC_MINIO_URL=http://minio:9000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - ai-drama-net
+    restart: unless-stopped
+
+  # ============ Backend (FastAPI) ============
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: ai-drama-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=false
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-ai-drama-studio-assets}
+      - AGNES_API_KEY=${AGNES_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HF_API_TOKEN=${HF_API_TOKEN}
+      - KLING_API_KEY=${KLING_API_KEY}
+      - SEEDANCE_API_KEY=${SEEDANCE_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - CORS_ORIGINS=["http://localhost:3000"]
+      - FFMPEG_PATH=ffmpeg
+      - FFPROBE_PATH=ffprobe
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-drama-net
+    restart: unless-stopped
+
+  # ============ Celery Worker ============
+  celery-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: ai-drama-celery
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - DEBUG=false
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-ai-drama-studio-assets}
+      - AGNES_API_KEY=${AGNES_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HF_API_TOKEN=${HF_API_TOKEN}
+      - KLING_API_KEY=${KLING_API_KEY}
+      - SEEDANCE_API_KEY=${SEEDANCE_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - FFMPEG_PATH=ffmpeg
+      - FFPROBE_PATH=ffprobe
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - ai-drama-net
+    restart: unless-stopped
+
+  # ============ PostgreSQL ============
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-drama-postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-ai_drama_studio}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ai_drama_studio}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-drama-net
+    restart: unless-stopped
+
+  # ============ Redis ============
+  redis:
+    image: redis:7-alpine
+    container_name: ai-drama-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ai-drama-net
+    restart: unless-stopped
+
+  # ============ MinIO ============
+  minio:
+    image: minio/minio:latest
+    container_name: ai-drama-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-drama-net
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    driver: local
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
+
+networks:
+  ai-drama-net:
+    driver: bridge

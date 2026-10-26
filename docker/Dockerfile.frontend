@@ -1,0 +1,40 @@
+# ===== 构建阶段 =====
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# 更换为国内镜像源（淘宝源）
+RUN npm config set registry https://registry.npmmirror.com
+
+# 复制依赖定义文件
+COPY frontend/package.json ./
+COPY frontend/package-lock.json* ./
+
+# 安装依赖
+RUN npm install --legacy-peer-deps
+
+# 复制源码
+COPY frontend/ .
+
+# 构建 Next.js 生产版本
+RUN npm run build
+
+# ===== 运行阶段 =====
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# 复制构建产物和必要的运行时文件
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+
+EXPOSE 3000
+
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["node", "server.js"]

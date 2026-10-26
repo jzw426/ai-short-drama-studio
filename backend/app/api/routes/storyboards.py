@@ -1,0 +1,346 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List
+
+from app.core.database import get_db
+from app.core.deps import get_current_user
+from app.models.storyboard import Storyboard, Shot
+from app.core.quota import check_ai_quota, consume_ai_quota
+from app.models.project import Project
+from app.models.user import User
+from app.schemas.storyboard import (
+    StoryboardUpdate, StoryboardResponse, ShotCreate, ShotUpdate, ShotResponse,
+)
+
+router = APIRouter(tags=["Storyboards"])
+
+
+async def _get_project_or_404(
+    project_id: str, owner_id: str, db: AsyncSession
+) -> Project:
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(Project).where(
+            Project.id == project_id, Project.owner_id == owner_id
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return project
+
+
+async def _get_storyboard_or_create(
+    project_id: str, owner_id: str, db: AsyncSession
+) -> Storyboard:
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(Storyboard).where(Storyboard.project_id == project_id)
+    )
+    storyboard = result.scalar_one_or_none()
+    if not storyboard:
+        await _get_project_or_404(project_id, owner_id, db)
+        storyboard = Storyboard(project_id=project_id)
+        db.add(storyboard)
+        await db.flush()
+        await db.refresh(storyboard)
+    return storyboard
+
+
+@router.get("/projects/{project_id}/storyboard", response_model=StoryboardResponse)
+async def get_storyboard(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取项目分镜"""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    await _get_project_or_404(project_id, current_user.id, db)
+    result = await db.execute(
+        select(Storyboard)
+        .where(Storyboard.project_id == project_id)
+        .options(selectinload(Storyboard.shots))
+    )
+    storyboard = result.scalar_one_or_none()
+    if not storyboard:
+        storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+        result = await db.execute(
+            select(Storyboard)
+            .where(Storyboard.id == storyboard.id)
+            .options(selectinload(Storyboard.shots))
+        )
+        storyboard = result.scalar_one()
+
+    return storyboard
+
+
+@router.put("/projects/{project_id}/storyboard", response_model=StoryboardResponse)
+async def update_storyboard(
+    project_id: str,
+    data: StoryboardUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新分镜画布状态"""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(storyboard, key, value)
+
+    await db.flush()
+
+    result = await db.execute(
+        select(Storyboard)
+        .where(Storyboard.id == storyboard.id)
+        .options(selectinload(Storyboard.shots))
+    )
+    return result.scalar_one()
+
+
+# ===== 镜头管理 =====
+
+@router.get("/projects/{project_id}/storyboard/shots", response_model=List[ShotResponse])
+async def list_shots(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取所有镜头"""
+    from sqlalchemy import select
+
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+    result = await db.execute(
+        select(Shot)
+        .where(Shot.storyboard_id == storyboard.id)
+        .order_by(Shot.sort_order)
+    )
+    return list(result.scalars().all())
+
+
+@router.post("/projects/{project_id}/storyboard/shots", response_model=ShotResponse, status_code=201)
+async def create_shot(
+    project_id: str,
+    data: ShotCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """创建新镜头"""
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+
+    shot = Shot(
+        storyboard_id=storyboard.id,
+        shot_number=data.shot_number,
+        label=data.label,
+        description=data.description,
+        duration=data.duration,
+        camera_angle=data.camera_angle,
+        transition=data.transition,
+        scene_ref=data.scene_ref,
+        character_refs=data.character_refs,
+        sort_order=data.sort_order,
+    )
+    db.add(shot)
+    await db.flush()
+    await db.refresh(shot)
+    return shot
+
+
+@router.put("/projects/{project_id}/storyboard/shots/{shot_id}", response_model=ShotResponse)
+async def update_shot(
+    project_id: str,
+    shot_id: str,
+    data: ShotUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """更新镜头"""
+    from sqlalchemy import select
+
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+    result = await db.execute(
+        select(Shot).where(Shot.id == shot_id, Shot.storyboard_id == storyboard.id)
+    )
+    shot = result.scalar_one_or_none()
+    if not shot:
+        raise HTTPException(status_code=404, detail="镜头不存在")
+
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(shot, key, value)
+
+    await db.flush()
+    await db.refresh(shot)
+    return shot
+
+
+@router.delete("/projects/{project_id}/storyboard/shots/{shot_id}", status_code=204)
+async def delete_shot(
+    project_id: str,
+    shot_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """删除镜头"""
+    from sqlalchemy import select
+
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+    result = await db.execute(
+        select(Shot).where(Shot.id == shot_id, Shot.storyboard_id == storyboard.id)
+    )
+    shot = result.scalar_one_or_none()
+    if not shot:
+        raise HTTPException(status_code=404, detail="镜头不存在")
+
+    await db.delete(shot)
+    await db.flush()
+    return None
+
+
+@router.post("/projects/{project_id}/storyboard/generate-from-script")
+async def generate_storyboard_from_script(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """从剧本场景一键生成分镜镜头（AI），替换已有镜头（受每日配额限制）"""
+    allowed, used, limit = await check_ai_quota(db, current_user.id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"今日 AI 调用已达上限（{limit} 次），请明天再试",
+        )
+    from sqlalchemy import select
+    from app.models.script import Script, Scene
+    from app.services.ai_service import ai_service
+
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+
+    # 读取剧本场景
+    script_result = await db.execute(
+        select(Script).where(Script.project_id == project_id)
+    )
+    script = script_result.scalar_one_or_none()
+    scenes: List[Scene] = []
+    if script:
+        scene_result = await db.execute(
+            select(Scene)
+            .where(Scene.script_id == script.id)
+            .order_by(Scene.sort_order)
+        )
+        scenes = list(scene_result.scalars().all())
+
+    if not scenes:
+        raise HTTPException(
+            status_code=400,
+            detail="剧本还没有场景，请先在剧本工坊创建场景后再生成分镜",
+        )
+
+    # 清空旧镜头（替换语义）
+    old_result = await db.execute(
+        select(Shot).where(Shot.storyboard_id == storyboard.id)
+    )
+    for shot in old_result.scalars().all():
+        await db.delete(shot)
+    await db.flush()
+
+    # 逐场景生成镜头
+    created = []
+    shot_number = 1
+    sort_order = 0
+    for scene in scenes:
+        prompt = (
+            f"场景 {scene.scene_number}：{scene.title}\n"
+            f"地点：{scene.location}，时段：{scene.time_of_day}，"
+            f"{'内景' if scene.interior else '外景'}\n"
+            f"剧情概要：{scene.summary}\n"
+            f"详细内容：{scene.content}"
+        )
+        shots = await ai_service.generate_storyboard(prompt)
+        for s in shots:
+            shot = Shot(
+                storyboard_id=storyboard.id,
+                shot_number=shot_number,
+                label=s["label"],
+                description=s["description"],
+                duration=s["duration"],
+                camera_angle=s["camera_angle"],
+                transition=s["transition"],
+                scene_ref=scene.title,
+                character_refs=[],
+                sort_order=sort_order,
+            )
+            db.add(shot)
+            created.append(
+                {
+                    "scene": scene.title,
+                    "label": s["label"],
+                    "description": s["description"],
+                    "duration": s["duration"],
+                    "camera_angle": s["camera_angle"],
+                    "transition": s["transition"],
+                }
+            )
+            shot_number += 1
+            sort_order += 1
+
+    await db.flush()
+    await consume_ai_quota(db, current_user.id)
+    return {"status": "success", "total": len(created), "shots": created}
+
+
+@router.get("/projects/{project_id}/storyboard/export")
+async def export_storyboard(
+    project_id: str,
+    format: str = "json",
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """导出分镜镜头（json）"""
+    from fastapi.responses import Response
+    from sqlalchemy import select
+
+    await _get_project_or_404(project_id, current_user.id, db)
+    result = await db.execute(
+        select(Shot)
+        .join(Storyboard, Storyboard.id == Shot.storyboard_id)
+        .where(Storyboard.project_id == project_id)
+        .order_by(Shot.sort_order)
+    )
+    shots = result.scalars().all()
+
+    if (format or "json").lower() != "json":
+        raise HTTPException(status_code=400, detail="仅支持 json 格式")
+
+    data = {
+        "project_id": project_id,
+        "total": len(shots),
+        "shots": [
+            {
+                "shot_number": s.shot_number,
+                "label": s.label,
+                "description": s.description,
+                "duration": s.duration,
+                "camera_angle": s.camera_angle,
+                "transition": s.transition,
+                "scene_ref": s.scene_ref,
+                "character_refs": s.character_refs or [],
+            }
+            for s in shots
+        ],
+    }
+    import json as _json
+
+    return Response(
+        content=_json.dumps(data, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="storyboard_{project_id[:8]}.json"'
+        },
+    )
