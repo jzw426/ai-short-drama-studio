@@ -11,8 +11,8 @@ from app.schemas.script import (
     ScriptUpdate, ScriptResponse, SceneCreate, SceneUpdate, SceneResponse,
     AIGenerateRequest, AIGenerateResponse,
 )
-from app.services.ai_service import ai_service
-from app.core.quota import check_ai_quota, consume_ai_quota
+from app.services.ai_service import AIUnavailableError, ai_service
+from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota
 
 router = APIRouter(tags=["Scripts"])
 
@@ -123,20 +123,22 @@ async def ai_generate_script(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """AI 辅助生成剧本内容（受每日配额限制）"""
-    allowed, used, limit = await check_ai_quota(db, current_user.id)
-    if not allowed:
-        raise HTTPException(
-            status_code=429,
-            detail=f"今日 AI 调用已达上限（{limit} 次），请明天再试",
-        )
+    """AI 辅助生成剧本内容（受每日配额限制）
+
+    配额先占后用：AI 失败退回，不扣用户额度；AI 全失败返回 503，绝不返回假内容。
+    """
     script = await _get_script_or_create(project_id, current_user.id, db)
+    await acquire_ai_quota_or_429(db, current_user.id)
 
     existing_context = script.content[-2000:] if script.content else ""
-    generated = await ai_service.generate_script(
-        prompt=request.prompt,
-        context=existing_context,
-    )
+    try:
+        generated = await ai_service.generate_script(
+            prompt=request.prompt,
+            context=existing_context,
+        )
+    except AIUnavailableError as e:
+        await refund_ai_quota(db, current_user.id)
+        raise HTTPException(status_code=503, detail=f"AI 剧本生成失败：{e}") from e
 
     # 记录历史
     history = AIPromptHistory(
@@ -154,7 +156,6 @@ async def ai_generate_script(
     script.word_count = len(script.content)
 
     await db.flush()
-    await consume_ai_quota(db, current_user.id)
 
     return AIGenerateResponse(
         generated_content=generated,

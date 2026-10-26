@@ -1,7 +1,6 @@
 import os
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 
 from app.core.config import settings
@@ -17,6 +16,7 @@ from app.api.routes import (
     assets,
     auth,
     ops,
+    media,
 )
 
 
@@ -75,11 +75,11 @@ app.add_middleware(
 # 请求日志 + 指标采集中间件（放在 CORS 之后，metrics/health 自排除）
 app.add_middleware(RequestLogMiddleware)
 
-# 本地存储模式下挂载静态文件目录
+# 本地存储：只保证目录存在，不再公开挂载。
+# M1 起 /uploads 由受控端点提供（签名 URL 或"登录 + 项目归属"），
+# 见 app/api/routes/media.py。
 if settings.STORAGE_TYPE == "local":
-    uploads_path = os.path.abspath(settings.STORAGE_LOCAL_PATH)
-    os.makedirs(uploads_path, exist_ok=True)
-    app.mount("/uploads", StaticFiles(directory=uploads_path), name="uploads")
+    os.makedirs(os.path.abspath(settings.STORAGE_LOCAL_PATH), exist_ok=True)
 
 # 注册路由
 # 业务路由统一要求登录（Bearer Token），auth/ops 路由开放
@@ -91,3 +91,5 @@ app.include_router(storyboards.router, prefix="/api/v1", dependencies=[Depends(g
 app.include_router(characters.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 app.include_router(render.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 app.include_router(assets.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+# 媒体端点挂在根路径（/uploads/...），鉴权在端点内部完成（签名 或 登录+归属）
+app.include_router(media.router)

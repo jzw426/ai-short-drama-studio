@@ -6,6 +6,14 @@ from typing import List, Optional
 from app.core.config import settings
 
 
+class AIUnavailableError(RuntimeError):
+    """所有 AI provider 均失败，或返回内容不可用。
+
+    调用方必须转成 5xx 明确告知用户；**禁止**用 mock/占位内容假装成功，
+    否则用户为假结果付费、前端无法区分真假、排障时无法定位。
+    """
+
+
 class AIService:
     """
     AI 服务封装（多模型路由）
@@ -13,7 +21,7 @@ class AIService:
     - 图片生成：provider 链（默认 agnes-image-2.1-flash → 角色形象、场景图）
     - 视频生成：provider 链（默认 agnes-video-v2.0 → 视频片段，异步轮询）
     路由规则：每个能力按 settings.AI_*_PROVIDERS 顺序尝试，
-    某 provider 失败自动切换下一个；全部失败才降级 mock/空结果。
+    某 provider 失败自动切换下一个；全部失败抛 AIUnavailableError（绝不返回假数据）。
     API Key 申请：https://platform.agnes-ai.com/settings/apiKeys
     """
 
@@ -166,16 +174,13 @@ class AIService:
         else:
             messages.append({"role": "user", "content": prompt})
 
-        try:
-            content = await self._chat_completions(
-                messages, max_tokens=2000, temperature=0.8
-            )
-            if content is None:
-                raise RuntimeError("all text providers failed")
-            return content
-        except Exception as e:
-            print(f"[AI Service] script generation failed: {e}")
-            return await self._mock_script_generation(prompt)
+        content = await self._chat_completions(
+            messages, max_tokens=2000, temperature=0.8
+        )
+        if not content or not content.strip():
+            print("[AI Service] script generation failed: 所有文本 provider 均失败")
+            raise AIUnavailableError("所有文本 AI provider 均不可用，未生成任何内容")
+        return content
 
     async def generate_character(self, description: str) -> dict:
         """使用文本 provider 链生成角色设定"""
@@ -187,23 +192,27 @@ class AIService:
             "只返回 JSON，不要有任何其他文字。"
         )
 
+        content = await self._chat_completions(
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": description}],
+            max_tokens=1000,
+            temperature=0.9,
+            response_format={"type": "json_object"},
+        )
+        if not content:
+            print("[AI Service] character generation failed: 所有文本 provider 均失败")
+            raise AIUnavailableError("所有文本 AI provider 均不可用，未生成角色设定")
+
+        text = content.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("\n```", 1)[0]
         try:
-            content = await self._chat_completions(
-                [{"role": "system", "content": system_prompt},
-                 {"role": "user", "content": description}],
-                max_tokens=1000,
-                temperature=0.9,
-                response_format={"type": "json_object"},
-            )
-            if content is None:
-                raise RuntimeError("all text providers failed")
-            text = content.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("\n```", 1)[0]
-            return json.loads(text)
-        except Exception as e:
-            print(f"[AI Service] character generation failed: {e}")
-            return self._mock_character_generation(description)
+            parsed = json.loads(text)
+        except (ValueError, TypeError) as e:
+            raise AIUnavailableError(f"AI 返回的角色设定不是合法 JSON: {e}") from e
+        if not isinstance(parsed, dict) or not str(parsed.get("name") or "").strip():
+            raise AIUnavailableError("AI 返回的角色设定缺少 name 字段")
+        return parsed
 
     async def generate_storyboard(self, prompt: str) -> List[dict]:
         """
@@ -222,34 +231,34 @@ class AIService:
             'transition(转场，如"硬切"、"淡入")。不要有任何其他文字。'
         )
 
+        content = await self._chat_completions(
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": prompt}],
+            max_tokens=1500,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+        if not content:
+            print("[AI Service] storyboard generation failed: 所有文本 provider 均失败")
+            raise AIUnavailableError("所有文本 AI provider 均不可用，未生成分镜")
+
+        text = content.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("\n```", 1)[0]
         try:
-            content = await self._chat_completions(
-                [{"role": "system", "content": system_prompt},
-                 {"role": "user", "content": prompt}],
-                max_tokens=1500,
-                temperature=0.7,
-                response_format={"type": "json_object"},
-            )
-            if content is None:
-                raise RuntimeError("all text providers failed")
-            text = content.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("\n```", 1)[0]
             parsed = json.loads(text)
-            # 兼容 {"shots": [...]} 与直接数组两种返回
-            if isinstance(parsed, dict):
-                parsed = parsed.get("shots") or parsed.get("data") or []
-            if not isinstance(parsed, list):
-                raise ValueError("unexpected shape")
-            cleaned = self._sanitize_shots(parsed)
-            # AI 返回空镜头时兜底为 mock，保证生成接口总有产出
-            if not cleaned:
-                print(f"[AI Service] storyboard returned empty, fallback to mock")
-                return self._mock_storyboard_generation(prompt)
-            return cleaned
-        except Exception as e:
-            print(f"[AI Service] storyboard generation failed: {e}")
-            return self._mock_storyboard_generation(prompt)
+        except (ValueError, TypeError) as e:
+            raise AIUnavailableError(f"AI 返回的分镜不是合法 JSON: {e}") from e
+        # 兼容 {"shots": [...]} 与直接数组两种返回
+        if isinstance(parsed, dict):
+            parsed = parsed.get("shots") or parsed.get("data") or []
+        if not isinstance(parsed, list):
+            raise AIUnavailableError("AI 返回的分镜结构无法识别")
+
+        cleaned = self._sanitize_shots(parsed)
+        if not cleaned:
+            raise AIUnavailableError("AI 返回的分镜为空")
+        return cleaned
 
     @staticmethod
     def _sanitize_shots(shots: list) -> List[dict]:
@@ -268,31 +277,6 @@ class AIService:
                 "transition": str(s.get("transition", "硬切"))[:50],
             })
         return result
-
-    def _mock_storyboard_generation(self, prompt: str) -> List[dict]:
-        return [
-            {
-                "label": "开场环境",
-                "description": f"全景展现场景环境：{prompt[:40]}... 光线自然，交代空间关系",
-                "duration": 3,
-                "camera_angle": "全景",
-                "transition": "淡入",
-            },
-            {
-                "label": "人物动作",
-                "description": "中景跟随主角动作，突出情绪与细节",
-                "duration": 4,
-                "camera_angle": "中景",
-                "transition": "硬切",
-            },
-            {
-                "label": "情绪特写",
-                "description": "特写面部表情，强化戏剧张力，提示：配置 AGNES_API_KEY 启用真实 AI 分镜",
-                "duration": 3,
-                "camera_angle": "特写",
-                "transition": "硬切",
-            },
-        ]
 
     # ==================== 图片生成（多 provider 路由） ====================
 
@@ -462,32 +446,6 @@ class AIService:
     ) -> Optional[str]:
         """使用视频 provider 链生成视频片段（文生视频/图生视频）"""
         return await self._video_generations(prompt, image_url, duration)
-
-    # ===== Mock 方法（全部 provider 失败时的降级方案） =====
-
-    async def _mock_script_generation(self, prompt: str) -> str:
-        return (
-            f'【AI自动生成】\n\n根据提示「{prompt[:50]}...」\n\n'
-            f'【场景：客厅 - 白天】\n\n'
-            f'阳光透过窗帘洒在茶几上，空气中弥漫着咖啡的香气。\n\n'
-            f'主角缓缓坐下，眼神中透露着复杂的情绪。\n\n'
-            f'"有些事情，终究要面对。"\n\n'
-            f'（镜头缓缓推进，聚焦在主角手中的旧照片上）\n\n'
-            f'提示：在 https://platform.agnes-ai.com 获取免费 API Key，'
-            f'填入 .env 的 AGNES_API_KEY 以启用真实 AI 剧本生成。'
-        )
-
-    def _mock_character_generation(self, description: str) -> dict:
-        return {
-            "name": "未命名角色",
-            "role": "protagonist",
-            "description": f"根据描述「{description[:30]}...」生成的角色",
-            "voice": "青年男声",
-            "age": 25,
-            "gender": "male",
-            "traits": ["勇敢", "善良", "有坚定信念"],
-            "backstory": "提示：配置 AGNES_API_KEY 以启用免费 AI 角色生成。",
-        }
 
 
 ai_service = AIService()

@@ -229,6 +229,16 @@ class Settings(BaseSettings):
     AI_PROVIDER_FAILURE_THRESHOLD: int = 3
     AI_PROVIDER_COOLDOWN_SECONDS: int = 60
 
+    # ---- 媒体访问控制（M1）----
+    # 签名 URL 有效期（秒）。本地存储不再公开挂载 /uploads，
+    # 未签名请求必须"已登录 + 是该项目的 owner"才放行。
+    MEDIA_URL_TTL_SECONDS: int = 21600
+
+    # ---- 登录限流（M1）----
+    # 同一 "IP+用户名" 连续失败 LOGIN_MAX_FAILURES 次后锁定 LOGIN_LOCKOUT_SECONDS 秒。
+    LOGIN_MAX_FAILURES: int = 5
+    LOGIN_LOCKOUT_SECONDS: int = 300
+
     # FFmpeg
     FFMPEG_PATH: str = "ffmpeg"
     FFPROBE_PATH: str = "ffprobe"

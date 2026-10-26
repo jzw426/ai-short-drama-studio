@@ -6,6 +6,7 @@ from typing import List
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.media_urls import sign_media_url
 from app.models.asset import RenderTask
 from app.models.project import Project
 from app.models.user import User
@@ -100,7 +101,7 @@ async def get_render_status(
         task_id=str(task.id),
         status=task.status,
         progress=task.progress,
-        output_url=task.output_url,
+        output_url=sign_media_url(task.output_url),
         error_message=task.error_message,
     )
 
@@ -120,7 +121,10 @@ async def list_render_tasks(
         .where(RenderTask.project_id == project_id)
         .order_by(RenderTask.created_at.desc())
     )
-    return list(result.scalars().all())
+    tasks = [RenderTaskResponse.model_validate(t) for t in result.scalars().all()]
+    for t in tasks:
+        t.output_url = sign_media_url(t.output_url)
+    return tasks
 
 
 @router.post("/render/{task_id}/cancel", response_model=RenderStatusResponse)
@@ -153,7 +157,7 @@ async def cancel_render_task(
         task_id=str(task.id),
         status=task.status,
         progress=task.progress,
-        output_url=task.output_url,
+        output_url=sign_media_url(task.output_url),
         error_message=task.error_message,
     )
 
@@ -173,4 +177,4 @@ async def get_download_url(
     if not task.output_url:
         raise HTTPException(status_code=404, detail="输出文件不存在")
 
-    return {"download_url": task.output_url}
+    return {"download_url": sign_media_url(task.output_url)}

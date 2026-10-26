@@ -11,6 +11,7 @@ from app.core.deps import get_current_user
 from app.models.asset import Asset
 from app.models.project import Project
 from app.models.user import User
+from app.core.media_urls import sign_media_url
 from app.schemas.asset import AssetResponse
 from app.services.storage_service import storage_service, extract_object_name
 
@@ -84,7 +85,11 @@ async def list_assets(
     stmt = stmt.order_by(Asset.uploaded_at.desc())
 
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    responses = [AssetResponse.model_validate(a) for a in result.scalars().all()]
+    for resp in responses:
+        resp.url = sign_media_url(resp.url) or resp.url
+        resp.thumbnail_url = sign_media_url(resp.thumbnail_url)
+    return responses
 
 
 @router.post("/projects/{project_id}/assets/upload", status_code=201)
@@ -167,7 +172,9 @@ async def upload_asset(
     await db.flush()
     await db.refresh(asset)
 
-    return AssetResponse.model_validate(asset)
+    resp = AssetResponse.model_validate(asset)
+    resp.url = sign_media_url(resp.url) or resp.url
+    return resp
 
 
 @router.delete("/assets/{asset_id}", status_code=204)
@@ -201,8 +208,10 @@ async def get_asset_url(
     """获取素材的访问 URL（仅限归属用户）"""
     asset = await _get_owned_asset_or_404(asset_id, current_user.id, db)
 
-    # 生成访问 URL（有效期 1 小时）
-    object_name = asset.url.split("ai-drama-studio-assets/", 1)[-1] if "ai-drama-studio-assets/" in asset.url else ""
+    # 生成访问 URL：local 模式返回带 exp/sig 的签名链接，MinIO 模式返回预签名链接
+    object_name = extract_object_name(asset.url)
+    if not object_name:
+        raise HTTPException(status_code=404, detail="素材存储对象缺失")
     presigned_url = await storage_service.get_presigned_url(object_name)
 
-    return {"url": presigned_url}
+    return {"url": sign_media_url(presigned_url) or presigned_url}

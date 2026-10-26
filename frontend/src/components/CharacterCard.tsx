@@ -2,6 +2,8 @@
 
 import { User, Edit2, Mic, MoreHorizontal, ImagePlus, Loader2 } from "lucide-react";
 
+import { mediaUrl } from "@/lib/api";
+
 /** 与后端 CharacterResponse 字段对齐（snake_case） */
 export interface Character {
   id: string;
@@ -39,7 +41,7 @@ export function CharacterCard({
         <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-primary-100 to-primary-200 flex items-center justify-center overflow-hidden">
           {character.avatar_url ? (
             <img
-              src={character.avatar_url}
+              src={mediaUrl(character.avatar_url)}
               alt={character.name}
               className="w-full h-full rounded-xl object-cover"
             />

@@ -4,11 +4,19 @@ from typing import List, Optional
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.media_urls import sign_media_url
 from app.models.project import Project, ProjectStatus
 from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 
 router = APIRouter(tags=["Projects"])
+
+
+def _to_response(project: Project) -> ProjectResponse:
+    """ORM → 响应模型，并对 thumbnail 这类媒体链接做签名（数据库里存规范 URL）"""
+    resp = ProjectResponse.model_validate(project)
+    resp.thumbnail = sign_media_url(resp.thumbnail)
+    return resp
 
 
 async def _get_owned_project_or_404(
@@ -46,7 +54,7 @@ async def list_projects(
 
     result = await db.execute(stmt)
     projects = result.scalars().all()
-    return list(projects)
+    return [_to_response(p) for p in projects]
 
 
 @router.post("/projects", response_model=ProjectResponse, status_code=201)
@@ -66,7 +74,7 @@ async def create_project(
     db.add(project)
     await db.flush()
     await db.refresh(project)
-    return project
+    return _to_response(project)
 
 
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
@@ -76,7 +84,7 @@ async def get_project(
     current_user: User = Depends(get_current_user),
 ):
     """获取单个项目详情"""
-    return await _get_owned_project_or_404(project_id, current_user.id, db)
+    return _to_response(await _get_owned_project_or_404(project_id, current_user.id, db))
 
 
 @router.put("/projects/{project_id}", response_model=ProjectResponse)
@@ -97,7 +105,7 @@ async def update_project(
 
     await db.flush()
     await db.refresh(project)
-    return project
+    return _to_response(project)
 
 
 @router.delete("/projects/{project_id}", status_code=204)

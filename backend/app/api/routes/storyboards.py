@@ -5,7 +5,8 @@ from typing import List
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.storyboard import Storyboard, Shot
-from app.core.quota import check_ai_quota, consume_ai_quota
+from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota
+from app.services.ai_service import AIUnavailableError, ai_service
 from app.models.project import Project
 from app.models.user import User
 from app.schemas.storyboard import (
@@ -209,16 +210,14 @@ async def generate_storyboard_from_script(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """从剧本场景一键生成分镜镜头（AI），替换已有镜头（受每日配额限制）"""
-    allowed, used, limit = await check_ai_quota(db, current_user.id)
-    if not allowed:
-        raise HTTPException(
-            status_code=429,
-            detail=f"今日 AI 调用已达上限（{limit} 次），请明天再试",
-        )
+    """从剧本场景一键生成分镜镜头（AI），替换已有镜头（受每日配额限制）
+
+    两个关键语义：
+      * 一个场景 = 一次 AI 调用 = 一份配额（旧实现 N 个场景只扣 1 份）；
+      * **先全部生成成功，再替换旧镜头**（旧实现先删后调 AI，AI 失败会清空已有分镜）。
+    """
     from sqlalchemy import select
     from app.models.script import Script, Scene
-    from app.services.ai_service import ai_service
 
     storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
 
@@ -242,7 +241,37 @@ async def generate_storyboard_from_script(
             detail="剧本还没有场景，请先在剧本工坊创建场景后再生成分镜",
         )
 
-    # 清空旧镜头（替换语义）
+    # 按场景数预占配额（每个场景一次 AI 调用）；中途超限则把已占用的全部退回
+    reserved = 0
+    try:
+        for _ in range(len(scenes)):
+            await acquire_ai_quota_or_429(db, current_user.id)
+            reserved += 1
+    except HTTPException:
+        for _ in range(reserved):
+            await refund_ai_quota(db, current_user.id)
+        raise
+
+    # 逐场景生成（只写内存，不落库）；任一场景失败则整体回退
+    planned: List[tuple] = []
+    try:
+        for scene in scenes:
+            prompt = (
+                f"场景 {scene.scene_number}：{scene.title}\n"
+                f"地点：{scene.location}，时段：{scene.time_of_day}，"
+                f"{'内景' if scene.interior else '外景'}\n"
+                f"剧情概要：{scene.summary}\n"
+                f"详细内容：{scene.content}"
+            )
+            shots = await ai_service.generate_storyboard(prompt)
+            for s in shots:
+                planned.append((scene, s))
+    except AIUnavailableError as e:
+        for _ in range(reserved):
+            await refund_ai_quota(db, current_user.id)
+        raise HTTPException(status_code=503, detail=f"AI 分镜生成失败：{e}") from e
+
+    # 全部成功后才替换旧镜头
     old_result = await db.execute(
         select(Shot).where(Shot.storyboard_id == storyboard.id)
     )
@@ -250,23 +279,12 @@ async def generate_storyboard_from_script(
         await db.delete(shot)
     await db.flush()
 
-    # 逐场景生成镜头
     created = []
-    shot_number = 1
-    sort_order = 0
-    for scene in scenes:
-        prompt = (
-            f"场景 {scene.scene_number}：{scene.title}\n"
-            f"地点：{scene.location}，时段：{scene.time_of_day}，"
-            f"{'内景' if scene.interior else '外景'}\n"
-            f"剧情概要：{scene.summary}\n"
-            f"详细内容：{scene.content}"
-        )
-        shots = await ai_service.generate_storyboard(prompt)
-        for s in shots:
-            shot = Shot(
+    for idx, (scene, s) in enumerate(planned, start=1):
+        db.add(
+            Shot(
                 storyboard_id=storyboard.id,
-                shot_number=shot_number,
+                shot_number=idx,
                 label=s["label"],
                 description=s["description"],
                 duration=s["duration"],
@@ -274,24 +292,21 @@ async def generate_storyboard_from_script(
                 transition=s["transition"],
                 scene_ref=scene.title,
                 character_refs=[],
-                sort_order=sort_order,
+                sort_order=idx - 1,
             )
-            db.add(shot)
-            created.append(
-                {
-                    "scene": scene.title,
-                    "label": s["label"],
-                    "description": s["description"],
-                    "duration": s["duration"],
-                    "camera_angle": s["camera_angle"],
-                    "transition": s["transition"],
-                }
-            )
-            shot_number += 1
-            sort_order += 1
+        )
+        created.append(
+            {
+                "scene": scene.title,
+                "label": s["label"],
+                "description": s["description"],
+                "duration": s["duration"],
+                "camera_angle": s["camera_angle"],
+                "transition": s["transition"],
+            }
+        )
 
     await db.flush()
-    await consume_ai_quota(db, current_user.id)
     return {"status": "success", "total": len(created), "shots": created}
 
 

@@ -2,6 +2,8 @@ import axios from "axios";
 import { clearAuth } from "./auth";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+// 媒体地址（/uploads/...）挂在 API 根路径而非 /api/v1 下，需要单独取 origin
+const API_ORIGIN = API_BASE_URL.replace(/\/api\/v1\/?$/, "");
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -12,6 +14,20 @@ const api = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+/**
+ * 把后端返回的媒体地址补成可访问的绝对地址。
+ *
+ * 后端返回的 /uploads/... 带 exp+sig 签名（M1 起媒体不再公开），
+ * 但其路径是**相对 API 域**的；<img>/<video> 直接引用会被浏览器解析到前端域
+ * （如 localhost:3000/uploads/...）从而 404 或 401。这里统一补 API origin。
+ */
+export function mediaUrl(url?: string | null): string | undefined {
+  if (!url) return undefined;
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith("/")) return `${API_ORIGIN}${url}`;
+  return url;
+}
 
 // 响应拦截器
 api.interceptors.response.use(
