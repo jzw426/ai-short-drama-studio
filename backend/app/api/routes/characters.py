@@ -168,7 +168,11 @@ async def ai_generate_character(
 
     # AI 生成角色描述
     try:
-        char_info = await ai_service.generate_character(description=request.description)
+        char_info = await ai_service.generate_character(
+            description=request.description,
+            user_id=current_user.id,
+            project_id=project_id,
+        )
     except AIUnavailableError as e:
         await refund_ai_quota(db, current_user.id)
         raise HTTPException(status_code=503, detail=f"AI 角色生成失败：{e}") from e

@@ -52,12 +52,14 @@ def test_format_timestamp_carries_over():
     assert RenderService._format_timestamp(3661.25) == "01:01:01,250"
 
 
-def test_srt_by_description_is_single_line(service):
+def test_srt_by_description_splits_lines_into_cues(service):
     shots = [{"duration": 2.0, "description": "雨夜 街道\n霓虹闪烁", "label": "镜头1"}]
     srt, missing = service._generate_srt(shots, source="description")
-    # 换行被折叠成空格，且字幕正文自成一行（SRT 块之间本来就有换行）
-    assert "雨夜 街道 霓虹闪烁" in srt.splitlines()
-    assert "00:00:00,000 --> 00:00:02,000" in srt
+    # 换行也是切句边界：两行各占 2s 里按字符数分到的时长（5:4 → 1.111s / 0.889s）
+    assert "雨夜 街道" in srt.splitlines()
+    assert "霓虹闪烁" in srt.splitlines()
+    assert "00:00:00,000 --> 00:00:01,111" in srt
+    assert "00:00:01,111 --> 00:00:02,000" in srt
     assert missing == 0
 
 

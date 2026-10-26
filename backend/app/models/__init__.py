@@ -5,7 +5,7 @@ from app.models.storyboard import Storyboard, Shot
 from app.models.character import Character
 from app.models.asset import Asset, RenderTask
 from app.models.user import User
-from app.models.ai_usage import AIUsage
+from app.models.ai_usage import AIUsage, AIUsageEvent
 
 __all__ = [
     "Project",
@@ -19,4 +19,5 @@ __all__ = [
     "RenderTask",
     "User",
     "AIUsage",
+    "AIUsageEvent",
 ]

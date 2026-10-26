@@ -2,7 +2,12 @@
 
 对外暴露：
 - metrics.record(method, path, status_code, duration_ms, user_id=None)
+- metrics.record_ai_call(operation, status)      # AI 调用计数（M3-4）
+- metrics.record_render_failure(category)        # 渲染失败分类计数（M3-4）
 - metrics.snapshot() -> dict  聚合快照
+
+注意：这些都是**进程内**计数（worker 进程的计数不会出现在 API 进程的 /metrics 里），
+与既有的请求指标口径一致。
 """
 import threading
 import time
@@ -21,6 +26,10 @@ class Metrics:
         self._by_path: dict = defaultdict(lambda: {"count": 0, "errors": 0, "duration_ms_sum": 0.0})
         self._by_status: dict = defaultdict(int)
         self._in_flight = 0
+        # AI 调用计数：{(operation, status): count}
+        self._ai_calls: dict = defaultdict(int)
+        # 渲染失败分类：{category: count}
+        self._render_failures: dict = defaultdict(int)
 
     def begin(self):
         with self._lock:
@@ -52,6 +61,16 @@ class Metrics:
 
             self._by_status[str(status_code)] += 1
 
+    def record_ai_call(self, operation: str, status: str) -> None:
+        """AI 调用计数（按 operation+status）。记账失败也要计数——观测优先于落库。"""
+        with self._lock:
+            self._ai_calls[(str(operation or "unknown"), str(status or "unknown"))] += 1
+
+    def record_render_failure(self, category: str) -> None:
+        """渲染失败分类计数（ai_unavailable/ffmpeg/storage/timeout/cancelled/other）。"""
+        with self._lock:
+            self._render_failures[str(category or "other")] += 1
+
     def snapshot(self) -> dict:
         with self._lock:
             uptime = round(time.time() - self._started_at, 2)
@@ -69,6 +88,18 @@ class Metrics:
                 key=lambda x: x["count"],
                 reverse=True,
             )[:20]
+            ai_calls = [
+                {"operation": op, "status": st, "count": count}
+                for (op, st), count in sorted(
+                    self._ai_calls.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            ]
+            render_failures = [
+                {"category": category, "count": count}
+                for category, count in sorted(
+                    self._render_failures.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            ]
             return {
                 "total_requests": self._total,
                 "in_flight": self._in_flight,
@@ -78,6 +109,8 @@ class Metrics:
                 "uptime_seconds": uptime,
                 "by_status": dict(self._by_status),
                 "top_paths": top_paths,
+                "ai_calls_total": ai_calls,
+                "render_failures_total": render_failures,
             }
 
 

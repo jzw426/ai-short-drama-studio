@@ -27,6 +27,7 @@ async def _task_response(task: RenderTask) -> RenderTaskResponse:
     """
     resp = RenderTaskResponse.model_validate(task)
     resp.output_url = await signed_media_url(resp.output_url)
+    resp.subtitle_url = await signed_media_url(resp.subtitle_url)
     return resp
 
 
@@ -129,6 +130,12 @@ async def submit_render_task(
         response.status_code = 200
         return await _task_response(existing)
 
+    # M3-1 全栈实测出的竞态：只 flush 不 commit 就入队时，worker 可能先拿到消息、
+    # 后看到事务提交，_load_task 查不到行 → 日志 "Task ... not found"，任务永远
+    # 停在 queued。入队前必须先提交任务行。
+    await db.commit()
+    await db.refresh(render_task)
+
     # 提交 Celery 异步任务，并保存真实 celery task id 供取消使用
     # 注意：broker 不可达时 delay() 可能长时间重试，必须加超时保护，避免接口被挂死
     try:
@@ -162,6 +169,7 @@ async def get_render_status(
         status=task.status,
         progress=task.progress,
         output_url=await signed_media_url(task.output_url),
+        subtitle_url=await signed_media_url(task.subtitle_url),
         error_message=task.error_message,
     )
 
@@ -241,6 +249,7 @@ async def cancel_render_task(
         status=task.status,
         progress=task.progress,
         output_url=await signed_media_url(task.output_url),
+        subtitle_url=await signed_media_url(task.subtitle_url),
         error_message=task.error_message,
     )
 

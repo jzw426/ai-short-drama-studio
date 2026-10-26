@@ -264,7 +264,9 @@ async def generate_storyboard_from_script(
                 f"剧情概要：{scene.summary}\n"
                 f"详细内容：{scene.content}"
             )
-            shots = await ai_service.generate_storyboard(prompt)
+            shots = await ai_service.generate_storyboard(
+                prompt, user_id=current_user.id, project_id=project_id
+            )
             for s in shots:
                 planned.append((scene, s))
     except AIUnavailableError as e:

@@ -207,6 +207,63 @@ async def test_execute_render_produces_real_video(render_env):
     # 成功渲染不应产生任何 warning：说明 dialogue 取到了台词、SRT 写成、烧制成功。
     assert results["warnings"] == [], results["warnings"]
 
+    # srt 随片交付：文件落在成片同目录，结果里给出可直接下载的签名地址
+    srt_file = env.uploads / "renders" / project_id / task_id / "subtitle.srt"
+    assert srt_file.exists()
+    assert "别走。" in srt_file.read_text(encoding="utf-8")
+    subtitle_url = results.get("subtitle_url") or ""
+    assert f"/uploads/renders/{project_id}/{task_id}/subtitle.srt" in subtitle_url
+    assert "sig=" in subtitle_url and "exp=" in subtitle_url
+
+
+@pytest.mark.asyncio
+async def test_execute_render_soft_subtitles_muxs_track(render_env):
+    """soft 模式：不碰画面，只封一条 mov_text 软字幕轨，srt 仍然随片交付。"""
+    from app.services.render_service import render_service
+
+    env = render_env
+    project_id = await _seed(env)
+    for number in (1, 2):
+        _make_clip(env.uploads / "segments" / f"seg{number}.mp4", seconds=1.0)
+    _make_clip(env.uploads / "bgm" / "theme.wav", seconds=3.0, audio=True)
+
+    task_id = "task-soft"
+    results = await render_service.execute_render(
+        task_id,
+        project_id,
+        {
+            "resolution": "1080x1920",
+            "aspect_ratio": "9:16",
+            "fps": 24,
+            "quality": "low",
+            "add_subtitles": True,
+            "subtitle_source": "dialogue",
+            "subtitle_mode": "soft",
+            # 混 BGM 发生在字幕之后：这里顺带守住"混音不能把软字幕轨丢掉"
+            "add_bgm": True,
+            "bgm_source": "/uploads/bgm/theme.wav",
+        },
+    )
+
+    assert results["status"] == "completed", results.get("errors")
+    assert results["warnings"] == [], results["warnings"]
+
+    output = env.uploads / "renders" / project_id / task_id / "output.mp4"
+    assert output.exists()
+    info = _probe(output)
+    # 软字幕轨真的被封装进来了：mov_text 可以在播放器里开关，画面本身没被烧字
+    assert "Subtitle: mov_text" in info, info[-600:]
+    assert "1080x1920" in info
+
+    srt_file = env.uploads / "renders" / project_id / task_id / "subtitle.srt"
+    assert srt_file.exists(), sorted(
+        str(path.relative_to(env.uploads)) for path in (env.uploads / "renders").rglob("*")
+    )
+    assert "别走。" in srt_file.read_text(encoding="utf-8")
+    subtitle_url = results.get("subtitle_url") or ""
+    assert f"/uploads/renders/{project_id}/{task_id}/subtitle.srt" in subtitle_url
+    assert "sig=" in subtitle_url and "exp=" in subtitle_url
+
 
 @pytest.mark.asyncio
 async def test_execute_render_reports_unbound_shot(render_env, monkeypatch):

@@ -18,6 +18,7 @@ class CharacterUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     role: Optional[str] = None
     description: Optional[str] = None
+    avatar_url: Optional[str] = None
     voice: Optional[str] = None
     age: Optional[int] = None
     gender: Optional[str] = None

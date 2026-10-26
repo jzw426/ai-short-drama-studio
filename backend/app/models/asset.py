@@ -72,7 +72,12 @@ class RenderTask(Base):
     # 断点：已生成的片段清单（shot_number/video_url），重试时复用，不重新调用 AI
     checkpoint: Mapped[dict] = mapped_column(JSON, default=dict)
     output_url: Mapped[str] = mapped_column(String(2048), nullable=True)
+    # 字幕文件（M3-3）：成片之外单独落一份 srt，供下载与二次剪辑
+    subtitle_url: Mapped[str] = mapped_column(String(2048), nullable=True)
     error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    # 失败分类（M3-4）：ai_unavailable/ffmpeg/storage/timeout/cancelled/other
+    # 与 error_message 并存——message 给人看（含堆栈/截断），category 给聚合统计与告警
+    error_category: Mapped[str] = mapped_column(String(20), nullable=True, index=True)
     start_time: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     end_time: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     duration: Mapped[float] = mapped_column(Float, nullable=True)  # rendering duration in seconds

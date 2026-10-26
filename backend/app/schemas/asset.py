@@ -43,6 +43,7 @@ class RenderConfigSchema(BaseModel):
     * quality → H.264 CRF/preset（low/medium/high）。
     * visual_style → 归一化时套用的轻量调色（未知风格不调色，不做假动作）。
     * subtitle_source → dialogue（剧本台词，正解）/ description（画面描述，历史行为）/ label / none。
+    * subtitle_mode → hard（烧进画面，兼容一切播放器）/ soft（mov_text 软字幕轨，画质无损）/ both。
     """
 
     resolution: str = Field(default="1920x1080", pattern=r"^\d{3,4}x\d{3,4}$")
@@ -51,6 +52,7 @@ class RenderConfigSchema(BaseModel):
     visual_style: str = "电影级（Cinematic）"
     add_subtitles: bool = True
     subtitle_source: Literal["dialogue", "description", "label", "none"] = "dialogue"
+    subtitle_mode: Literal["hard", "soft", "both"] = "hard"
     add_bgm: bool = True
     bgm_source: Optional[str] = Field(default=None, max_length=2048)
     quality: Literal["low", "medium", "high"] = "high"
@@ -73,6 +75,7 @@ class RenderTaskResponse(BaseModel):
     progress: float
     config: dict
     output_url: Optional[str]
+    subtitle_url: Optional[str] = None
     error_message: Optional[str]
     start_time: Optional[datetime]
     end_time: Optional[datetime]
@@ -89,4 +92,5 @@ class RenderStatusResponse(BaseModel):
     status: str
     progress: float
     output_url: Optional[str]
+    subtitle_url: Optional[str] = None
     error_message: Optional[str]

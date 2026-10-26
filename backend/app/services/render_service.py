@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 
@@ -100,6 +101,7 @@ class RenderSpec:
     preset: str = "slow"
     style_filter: str = ""
     subtitle_source: str = "description"
+    subtitle_mode: str = "hard"
     subtitle_font_size: int = 24
 
     @property
@@ -125,6 +127,7 @@ class RenderSpec:
             "preset": self.preset,
             "style_filter": self.style_filter,
             "subtitle_source": self.subtitle_source,
+            "subtitle_mode": self.subtitle_mode,
         }
 
 
@@ -198,6 +201,12 @@ def build_spec(config: Optional[dict]) -> Tuple[RenderSpec, List[str]]:
         warnings.append(f"subtitle_source={subtitle_source!r} 未知，回退 description")
         subtitle_source = "description"
 
+    # 缺省按 hard：这是 M2 起的行为，老任务重放时必须仍然出硬字幕
+    subtitle_mode = str(config.get("subtitle_mode") or "hard").strip().lower()
+    if subtitle_mode not in SUBTITLE_MODES:
+        warnings.append(f"subtitle_mode={subtitle_mode!r} 未知，回退 hard")
+        subtitle_mode = "hard"
+
     spec = RenderSpec(
         width=width,
         height=height,
@@ -206,6 +215,7 @@ def build_spec(config: Optional[dict]) -> Tuple[RenderSpec, List[str]]:
         preset=preset,
         style_filter=style_filter,
         subtitle_source=subtitle_source,
+        subtitle_mode=subtitle_mode,
         # 字号跟着画布高度走：1080p 竖屏约 43px，720p 约 29px
         subtitle_font_size=max(16, min(72, round(height / 45))),
     )
@@ -252,6 +262,178 @@ def extract_dialogue(content: str) -> str:
             seen.add(line)
             found.append(line)
     return "\n".join(found)
+
+
+# ---------------------------------------------------------------------------
+# 字幕排版
+# ---------------------------------------------------------------------------
+
+# 切句边界：句末标点 + 句内停顿（，、: ; 也算）。按小句切而不是一条 cue 顶满
+# 整个镜头，字幕时间轴才能和台词真正说到哪对上；否则长台词会在画面上停很久。
+_SENTENCE_BREAKS = frozenset('。！？；…，、,.!?;:')
+# 右引号/右括号跟着前一句，否则「别走。」会被切成「别走。」和「」」两条
+_QUOTE_CLOSERS = frozenset('”’」』）)】》〉"\'')
+# 折行时优先在这些字符之后断开（标点后、空格后最自然）
+_WRAP_BREAKS = _SENTENCE_BREAKS | _QUOTE_CLOSERS | frozenset(' ')
+
+# 一条字幕至少停留 0.6s：再短人眼来不及读完，观感上就是闪一下
+SUBTITLE_MIN_SECONDS = 0.6
+# 单行超过约 18 个全角字符就折行（两行 × 18 个全角位 ≈ 竖屏 1080 宽放得下）
+SUBTITLE_MAX_LINE_UNITS = 18.0
+SUBTITLE_MODES = ("hard", "soft", "both")
+
+
+def _char_units(ch: str) -> float:
+    """字符占几个全角位：全角/宽字符算 1，半角（含 ASCII）算 0.5。"""
+    return 1.0 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 0.5
+
+
+def _display_units(text: str) -> float:
+    """整行显示宽度（按全角位折算），用来判断该不该折行。"""
+    return sum(_char_units(ch) for ch in text)
+
+
+def _split_subtitle_sentences(text: str) -> List[str]:
+    """按中英文标点（含换行）切句，标点保留在前一句末尾。
+
+    连续标点（…… ？！）和右引号归前一句，避免切出只有标点的空壳字幕；纯标点
+    碎片会并到相邻句子里。既没有标点也没有换行的整段就是一条字幕。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    segments: List[str] = []
+    buf: List[str] = []
+    ended = False
+
+    def flush() -> None:
+        nonlocal buf, ended
+        piece = " ".join("".join(buf).split())
+        if piece:
+            segments.append(piece)
+        buf = []
+        ended = False
+
+    for ch in text:
+        if ch == "\n":
+            flush()
+            continue
+        if ch in _SENTENCE_BREAKS:
+            buf.append(ch)
+            ended = True
+            continue
+        if ended and ch not in _QUOTE_CLOSERS:
+            flush()
+        buf.append(ch)
+    flush()
+
+    merged: List[str] = []
+    prefix = ""
+    for piece in segments:
+        has_text = any(
+            ch not in _SENTENCE_BREAKS and ch not in _QUOTE_CLOSERS for ch in piece
+        )
+        if has_text:
+            merged.append(prefix + piece)
+            prefix = ""
+        elif merged:
+            merged[-1] += piece
+        else:
+            prefix += piece
+    if prefix and merged:
+        merged[-1] += prefix
+    return merged
+
+
+def _group_subtitle_sentences(
+    sentences: Sequence[str], duration: float
+) -> List[List[int]]:
+    """把切好的句子分组成 cue，保证每条估算时长不小于 SUBTITLE_MIN_SECONDS。
+
+    估算按字符数占比，和 _generate_srt 里真正的时长分配口径一致。镜头本身比
+    最短展示时长还短时只能整段一条：不能为了一条字幕编出超过镜头的时长。
+    """
+    if not sentences or duration <= 0:
+        return []
+    weights = [max(1, len(sentence)) for sentence in sentences]
+    total = float(sum(weights))
+    groups: List[List[int]] = []
+    current: List[int] = []
+    current_weight = 0
+    for idx, weight in enumerate(weights):
+        current.append(idx)
+        current_weight += weight
+        if duration * current_weight / total >= SUBTITLE_MIN_SECONDS:
+            groups.append(current)
+            current = []
+            current_weight = 0
+    if current:
+        # 尾巴不足最短时长：并进上一条，而不是留一条闪一下的字幕
+        if groups:
+            groups[-1].extend(current)
+        else:
+            groups.append(current)
+    return groups
+
+
+def _join_subtitle_sentences(sentences: Sequence[str]) -> str:
+    """把同一条 cue 里的句子接起来：英文之间补空格，中文直接相接。"""
+    joined = ""
+    for piece in sentences:
+        if (
+            joined
+            and piece
+            and joined[-1].isascii()
+            and piece[0].isascii()
+            and joined[-1] != " "
+            and piece[0] != " "
+        ):
+            joined += " "
+        joined += piece
+    return joined
+
+
+def _wrap_subtitle_text(text: str) -> str:
+    """单行超过约 18 个全角字符时折成两行（最多两行，用 \n）。
+
+    两行比一行窄，视线移动少；超过两行就得缩字号，反而更难读，所以只折一次。
+    优先在标点/空格后断，但两行长度不能差太多（否则读起来要来回找行首）。
+    """
+    text = (text or "").strip()
+    if not text or _display_units(text) <= SUBTITLE_MAX_LINE_UNITS:
+        return text
+
+    widths = [_char_units(ch) for ch in text]
+    total = sum(widths)
+    # 允许两行各自略超 18，但不允许把一行撑到 20 以上
+    limit = SUBTITLE_MAX_LINE_UNITS + 2
+
+    best: Optional[int] = None
+    best_score = 0.0
+    units = 0.0
+    for idx, ch in enumerate(text[:-1]):
+        units += widths[idx]
+        if ch not in _WRAP_BREAKS:
+            continue
+        if units > limit or total - units > limit:
+            continue
+        score = abs(total - 2 * units)
+        if best is None or score < best_score:
+            best, best_score = idx + 1, score
+    if best is None:
+        # 没有合适的标点断点：按显示宽度对半分
+        units = 0.0
+        best = 1
+        for idx in range(len(text) - 1):
+            units += widths[idx]
+            best = idx + 1
+            if units >= total / 2:
+                break
+    first, second = text[:best].strip(), text[best:].strip()
+    if not first or not second:
+        return text
+    return f"{first}\n{second}"
 
 
 class RenderService:
@@ -354,15 +536,19 @@ class RenderService:
                 results["errors"].append(str(exc))
                 return results
 
+            subtitle_path: Optional[str] = None
             if spec.subtitle_source != "none":
                 await self._check_cancel(cancel_check)
-                await self._progress(progress_callback, 0.92, "烧制字幕...")
+                await self._progress(progress_callback, 0.92, "处理字幕...")
                 try:
-                    output_path = await self._add_subtitles(
-                        output_path, shots, durations, spec
-                    )
+                    (
+                        output_path,
+                        subtitle_path,
+                        subtitle_warnings,
+                    ) = await self._add_subtitles(output_path, shots, durations, spec)
+                    results["warnings"].extend(subtitle_warnings)
                 except RenderStepError as exc:
-                    results["warnings"].append(f"字幕未烧制（成片保留无字幕版）：{exc}")
+                    results["warnings"].append(f"字幕未交付（成片保留无字幕版）：{exc}")
 
             bgm_source = str(config.get("bgm_source") or "").strip()
             if config.get("add_bgm") and bgm_source:
@@ -382,6 +568,18 @@ class RenderService:
                 content_type="video/mp4",
             )
             results["output_url"] = output_url
+            if subtitle_path and os.path.isfile(subtitle_path):
+                # srt 随片走：软字幕轨只有支持的播放器能开，用户还需要一份能直接
+                # 打开/编辑的字幕文件。字幕上传失败不能把已经成功的成片判死。
+                try:
+                    results["subtitle_url"] = await self._upload_subtitle(
+                        subtitle_path,
+                        f"renders/{project_id}/{task_id}/subtitle.srt",
+                    )
+                except Exception as exc:  # noqa: BLE001 - 字幕文件是附加交付物
+                    results["warnings"].append(
+                        f"字幕文件未随片上传：{type(exc).__name__}: {exc}"
+                    )
             results["status"] = "completed"
             # 只在"有镜头但没全用上"时告警。正常成片不是 warning —— 旧写法把
             # "成片包含 2/2 个镜头"塞进 warnings，导致任何一次成功渲染都会带一条
@@ -907,20 +1105,59 @@ class RenderService:
         shots: List[dict],
         durations: Sequence[Optional[float]],
         spec: RenderSpec,
-    ) -> str:
-        """烧字幕。以片段目录为 cwd、只传文件名，绕开 Windows 盘符冒号破坏 filtergraph。"""
-        srt_text, missing = self._generate_srt(
-            shots, spec.subtitle_source, durations
-        )
+    ) -> Tuple[str, str, List[str]]:
+        """生成 SRT 并按 subtitle_mode 交付字幕。
+
+        返回 (成片路径, srt 路径, 附加告警)。srt 留在片段目录里由调用方随片
+        上传 —— 软字幕轨只有支持的播放器能开，用户还需要一份能直接打开/编辑
+        的字幕文件。
+
+        hard 烧进画面（兼容一切播放器，但不可关闭）；soft 不碰画面，只封一条
+        mov_text 字幕轨（画质无损，老播放器可能不显示）；both 两者都要。以片段
+        目录为 cwd、只传文件名，绕开 Windows 盘符冒号破坏 filtergraph。
+        """
+        srt_text, missing = self._generate_srt(shots, spec.subtitle_source, durations)
         if not srt_text.strip():
             raise RenderStepError("字幕", "没有可用的字幕文本")
 
         workdir = os.path.dirname(video_path)
         srt_name = "final_output.srt"
-        with open(os.path.join(workdir, srt_name), "w", encoding="utf-8") as fh:
+        srt_path = os.path.join(workdir, srt_name)
+        with open(srt_path, "w", encoding="utf-8") as fh:
             fh.write(srt_text)
 
         out_name = "final_output_subtitled.mp4"
+        out_path = os.path.join(workdir, out_name)
+        src_name = os.path.basename(video_path)
+        warnings: List[str] = []
+
+        if spec.subtitle_mode == "soft":
+            await self._mux_subtitles(src_name, srt_name, out_name, workdir)
+        elif spec.subtitle_mode == "both":
+            hardsub_name = "final_output_hardsub.mp4"
+            await self._burn_subtitles(src_name, srt_name, hardsub_name, spec, workdir)
+            try:
+                await self._mux_subtitles(hardsub_name, srt_name, out_name, workdir)
+            except RenderStepError as exc:
+                # 硬字幕已经成功：软轨只是附加能力，失败就降级成告警，
+                # 不能让一条可选轨道把整条成片判死
+                shutil.move(os.path.join(workdir, hardsub_name), out_path)
+                warnings.append(f"字幕软轨未封装（成片保留硬烧字幕）：{exc}")
+        else:
+            await self._burn_subtitles(src_name, srt_name, out_name, spec, workdir)
+        if missing:
+            logger.warning("[Render] %d 个镜头没有台词，字幕已回退画面描述", missing)
+        return out_path, srt_path, warnings
+
+    async def _burn_subtitles(
+        self,
+        src_name: str,
+        srt_name: str,
+        out_name: str,
+        spec: RenderSpec,
+        workdir: str,
+    ) -> None:
+        """把 SRT 硬烧进画面（视频必须重编码，crf/preset 沿用本次渲染参数）。"""
         style = (
             f"FontSize={spec.subtitle_font_size},PrimaryColour=&H00FFFFFF,"
             "OutlineColour=&H80000000,BorderStyle=1,Outline=1,Shadow=0"
@@ -931,7 +1168,7 @@ class RenderService:
                 "-y",
                 "-hide_banner",
                 "-loglevel", "error",
-                "-i", os.path.basename(video_path),
+                "-i", src_name,
                 "-vf", f"subtitles={srt_name}:force_style='{style}'",
                 "-c:v", "libx264",
                 "-crf", str(spec.crf),
@@ -944,9 +1181,51 @@ class RenderService:
             purpose="字幕烧制失败",
             cwd=workdir,
         )
-        if missing:
-            logger.warning("[Render] %d 个镜头没有台词，字幕已回退画面描述", missing)
-        return os.path.join(workdir, out_name)
+
+    async def _mux_subtitles(
+        self,
+        src_name: str,
+        srt_name: str,
+        out_name: str,
+        workdir: str,
+    ) -> None:
+        """把 SRT 封成 mov_text 软字幕轨：视频流 copy，画面一个像素都不重编码。"""
+        await self._ffmpeg(
+            [
+                settings.FFMPEG_PATH,
+                "-y",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", src_name,
+                "-i", srt_name,
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-map", "1:s:0",
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-c:s", "mov_text",
+                "-metadata:s:s:0", "language=chi",
+                "-movflags", "+faststart",
+                out_name,
+            ],
+            purpose="字幕软轨封装失败",
+            cwd=workdir,
+        )
+
+    async def _upload_subtitle(self, srt_path: str, object_name: str) -> str:
+        """随片上传播 srt，返回可直接下载的地址。
+
+        results 是调用方直接消费的，所以这里返回签名后的链接；成片本身仍然存
+        规范地址（由 API 层负责签名）。storage_service 是模块级实例而不是模块，
+        直接调它的实例方法即可：本地走 HMAC 签名，MinIO 走预签名。
+        """
+        canonical = await storage_service.upload_from_path(
+            object_name=object_name,
+            src_path=srt_path,
+            content_type="application/x-subrip",
+        )
+        signed = await storage_service.presigned_url_for(canonical)
+        return signed or canonical
 
     async def _add_bgm(self, video_path: str, bgm_source: str) -> str:
         """混入背景音乐；视频没有音轨时直接把 BGM 铺上去。只接受受控媒体地址。"""
@@ -974,17 +1253,19 @@ class RenderService:
             "-i", os.path.basename(video_path),
             "-i", source_arg,
         ]
+        # -map 只搬视频和音频会把刚封好的软字幕轨丢掉（soft/both 在混 BGM 之前
+        # 跑），所以这里显式带上字幕流；没有字幕流的成片 0:s? 匹配不到任何流。
         if await self._has_audio(video_path):
             cmd = base + [
                 "-filter_complex",
                 "[1:a]volume=0.3[bgm];[0:a][bgm]amix=inputs=2:duration=first[aout]",
-                "-map", "0:v", "-map", "[aout]",
-                "-c:v", "copy", "-shortest", out_name,
+                "-map", "0:v", "-map", "[aout]", "-map", "0:s?",
+                "-c:v", "copy", "-c:s", "copy", "-shortest", out_name,
             ]
         else:
             cmd = base + [
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", "copy", "-shortest", out_name,
+                "-map", "0:v", "-map", "1:a", "-map", "0:s?",
+                "-c:v", "copy", "-c:s", "copy", "-shortest", out_name,
             ]
         await self._ffmpeg(cmd, purpose="BGM 混音失败", cwd=workdir)
         return os.path.join(workdir, out_name)
@@ -997,18 +1278,21 @@ class RenderService:
     ) -> Tuple[str, int]:
         """生成 SRT。返回 (内容, 没有台词而回退的镜头数)。
 
-        时间轴用成片里片段的真实时长（durations），没有就用镜头表 duration。
+        时间轴全局累计：每个镜头的时长用成片里片段的真实时长（durations），
+        没有就用镜头表 duration；镜头内部再按句子字符数占比把时长分给多条
+        cue。最后一条对齐镜头末尾，所以整条时间轴严格等于 durations 之和，
+        不会因为逐条取整而漂出成片结尾。没有台词的镜头仍然占用它的时长。
         """
-        lines: List[str] = []
-        start = 0.0
+        entries: List[str] = []
+        cursor = 0.0
         missing = 0
+        index = 0
         for idx, shot in enumerate(shots):
             duration = None
             if durations and idx < len(durations):
                 duration = durations[idx]
             if not duration or duration <= 0:
                 duration = float(shot.get("duration") or 3.0)
-            end = start + duration
 
             text = ""
             if source == "dialogue":
@@ -1020,18 +1304,39 @@ class RenderService:
                 text = str(shot.get("label") or "")
             elif source == "description":
                 text = str(shot.get("description") or shot.get("label") or "")
-            text = " ".join(text.split())
-            if text:
-                lines.extend(
-                    [
-                        str(len(lines) // 4 + 1),
-                        f"{self._format_timestamp(start)} --> {self._format_timestamp(end)}",
-                        text,
-                        "",
-                    ]
-                )
-            start = end
-        return "\n".join(lines), missing
+
+            sentences = _split_subtitle_sentences(text)
+            groups = _group_subtitle_sentences(sentences, duration) if sentences else []
+            if groups:
+                weights = [max(1, len(sentence)) for sentence in sentences]
+                total_weight = float(sum(weights))
+                group_weight = 0
+                cue_start = cursor
+                shot_end = cursor + duration
+                for gi, group in enumerate(groups):
+                    group_weight += sum(weights[i] for i in group)
+                    # 最后一条对齐镜头末尾：浮点累计不会把成片结尾撑长
+                    cue_end = (
+                        shot_end
+                        if gi == len(groups) - 1
+                        else cursor + duration * group_weight / total_weight
+                    )
+                    index += 1
+                    cue_text = _wrap_subtitle_text(
+                        _join_subtitle_sentences([sentences[i] for i in group])
+                    )
+                    entries.extend(
+                        [
+                            str(index),
+                            f"{self._format_timestamp(cue_start)} --> "
+                            f"{self._format_timestamp(cue_end)}",
+                            cue_text,
+                            "",
+                        ]
+                    )
+                    cue_start = cue_end
+            cursor += duration
+        return "\n".join(entries), missing
 
     @staticmethod
     def _format_timestamp(seconds: float) -> str:

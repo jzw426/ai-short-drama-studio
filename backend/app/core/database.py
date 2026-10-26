@@ -1,4 +1,5 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
@@ -8,6 +9,14 @@ if settings.DATABASE_TYPE == "sqlite":
         settings.DATABASE_URL,
         echo=settings.DEBUG,
         connect_args={"check_same_thread": False},
+    )
+elif settings.DATABASE_NULL_POOL:
+    # Celery worker：每个任务 asyncio.run() 是独立事件循环，池化连接会跨循环复用
+    # → RuntimeError("... attached to a different loop")。NullPool 每任务新建连接。
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.DEBUG,
+        poolclass=NullPool,
     )
 else:
     engine = create_async_engine(

@@ -46,6 +46,10 @@ class Settings(BaseSettings):
 
     # 数据库
     DATABASE_TYPE: str = "sqlite"  # "postgres" or "sqlite"
+    # Celery 任务用 asyncio.run() 每任务新建事件循环，连接池里的 asyncpg 连接
+    # 属于上一个循环 → 第二个任务必报 "Future attached to a different loop"。
+    # worker 进程必须开 NullPool（每任务新建并当次关闭连接）。
+    DATABASE_NULL_POOL: bool = False
     DATABASE_PATH: str = str(_BACKEND_DIR / "data" / "app.db")  # SQLite 文件路径（绝对）
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432

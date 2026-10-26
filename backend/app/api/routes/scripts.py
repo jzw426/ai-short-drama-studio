@@ -135,6 +135,8 @@ async def ai_generate_script(
         generated = await ai_service.generate_script(
             prompt=request.prompt,
             context=existing_context,
+            user_id=current_user.id,
+            project_id=project_id,
         )
     except AIUnavailableError as e:
         await refund_ai_quota(db, current_user.id)
@@ -202,6 +204,7 @@ async def create_scene(
         interior=data.interior,
         summary=data.summary,
         content=data.content,
+        dialogue=data.dialogue,
         duration=data.duration,
         sort_order=data.sort_order,
     )
@@ -317,6 +320,13 @@ async def export_script(
             if scene.content:
                 lines.append("")
                 lines.append(scene.content)
+            if getattr(scene, "dialogue", ""):
+                lines.append("")
+                if fmt == "markdown":
+                    lines.append("**台词：**")
+                else:
+                    lines.append("台词：")
+                lines.append(scene.dialogue)
             lines.append("")
     elif script.content:
         lines.append(script.content)
