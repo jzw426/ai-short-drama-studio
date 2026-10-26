@@ -1,11 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { CharacterCard, Character } from "@/components/CharacterCard";
-import { Plus, Sparkles, Search, X, Loader2 } from "lucide-react";
-import { characterApi } from "@/lib/api";
-import { useProjectStore } from "@/store/useProjectStore";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import {
+  AlertTriangle,
+  Loader2,
+  Plus,
+  Search,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
+
+import { CharacterCard, type Character } from "@/components/CharacterCard";
+import { characterApi } from "@/lib/api";
+import { GENDER_OPTIONS, ROLE_OPTIONS, roleLabel } from "@/lib/labels";
+import { useCurrentProject } from "@/lib/useCurrentProject";
 
 const traitColors: Record<string, string> = {
   执着: "bg-blue-100 text-blue-700",
@@ -25,10 +35,9 @@ const traitColors: Record<string, string> = {
   幽默: "bg-yellow-100 text-yellow-700",
   神秘: "bg-purple-100 text-purple-700",
   冷酷: "bg-slate-100 text-slate-700",
-  善良温柔: "bg-green-100 text-green-700",
 };
 
-interface CreateForm {
+interface CharacterForm {
   name: string;
   role: string;
   description: string;
@@ -36,98 +45,170 @@ interface CreateForm {
   age: string;
   gender: string;
   traits: string;
+  backstory: string;
 }
 
-const EMPTY_FORM: CreateForm = {
+const EMPTY_FORM: CharacterForm = {
   name: "",
-  role: "",
+  role: "配角",
   description: "",
   voice: "",
   age: "",
-  gender: "male",
+  gender: "other",
   traits: "",
+  backstory: "",
 };
 
+function parseTraits(raw: string): string[] {
+  return raw
+    .split(/[,，、\s]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
 export default function CharactersPage() {
-  const currentProject = useProjectStore((s) => s.currentProject);
+  const { project, loading: projectLoading, error: projectError } = useCurrentProject();
+  const projectId = project?.id ?? null;
+
   const [characters, setCharacters] = useState<Character[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
-  const [showCreate, setShowCreate] = useState(false);
-  const [form, setForm] = useState<CreateForm>(EMPTY_FORM);
+
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<Character | null>(null);
+  const [form, setForm] = useState<CharacterForm>(EMPTY_FORM);
+  const [submitting, setSubmitting] = useState(false);
+
   const [aiDescription, setAiDescription] = useState("");
   const [aiGenerating, setAiGenerating] = useState(false);
   const [generatingId, setGeneratingId] = useState<string | null>(null);
 
-  const projectId = currentProject?.id ?? null;
-
   const loadCharacters = useCallback(async () => {
     if (!projectId) return;
     setLoading(true);
+    setError(null);
     try {
       const data = (await characterApi.list(projectId)) as unknown as Character[];
       setCharacters(Array.isArray(data) ? data : []);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "加载角色失败");
+      const msg = e instanceof Error ? e.message : "加载角色失败";
+      setError(msg);
+      toast.error(msg);
     } finally {
       setLoading(false);
     }
   }, [projectId]);
 
   useEffect(() => {
-    if (projectId) loadCharacters();
+    if (projectId) void loadCharacters();
+    else {
+      setCharacters([]);
+      setError(null);
+    }
   }, [projectId, loadCharacters]);
 
-  const filtered = characters.filter(
-    (c) =>
-      !searchTerm ||
-      c.name.includes(searchTerm) ||
-      c.role.includes(searchTerm) ||
-      c.description.includes(searchTerm)
-  );
+  const filtered = useMemo(() => {
+    const keyword = searchTerm.trim();
+    if (!keyword) return characters;
+    return characters.filter(
+      (c) =>
+        c.name.includes(keyword) ||
+        roleLabel(c.role).includes(keyword) ||
+        c.role.includes(keyword) ||
+        c.description.includes(keyword) ||
+        (c.traits ?? []).some((t) => t.includes(keyword))
+    );
+  }, [characters, searchTerm]);
 
-  const handleCreate = async () => {
-    if (!projectId) return;
+  const openCreate = () => {
+    setEditing(null);
+    setForm(EMPTY_FORM);
+    setFormOpen(true);
+  };
+
+  const openEdit = (character: Character) => {
+    setEditing(character);
+    setForm({
+      name: character.name,
+      role: character.role || "配角",
+      description: character.description ?? "",
+      voice: character.voice ?? "",
+      age: character.age ? String(character.age) : "",
+      gender: character.gender || "other",
+      traits: (character.traits ?? []).join("、"),
+      backstory: character.backstory ?? "",
+    });
+    setFormOpen(true);
+  };
+
+  const closeForm = () => {
+    if (submitting) return;
+    setFormOpen(false);
+    setEditing(null);
+  };
+
+  const handleSubmit = async () => {
+    if (!projectId || submitting) return;
     if (!form.name.trim()) {
       toast.error("请填写角色名");
       return;
     }
+    const payload = {
+      name: form.name.trim(),
+      role: form.role.trim() || "配角",
+      description: form.description.trim(),
+      voice: form.voice.trim(),
+      age: Math.max(0, Math.round(Number(form.age) || 0)),
+      gender: form.gender || "other",
+      traits: parseTraits(form.traits),
+      backstory: form.backstory.trim(),
+    };
+    setSubmitting(true);
     try {
-      const payload: Record<string, unknown> = {
-        name: form.name.trim(),
-        role: form.role.trim() || "配角",
-        description: form.description.trim(),
-      };
-      if (form.voice.trim()) payload.voice = form.voice.trim();
-      if (form.age) payload.age = parseInt(form.age, 10) || 0;
-      if (form.gender) payload.gender = form.gender;
-      if (form.traits.trim()) {
-        payload.traits = form.traits
-          .split(/[,，、\s]+/)
-          .filter(Boolean);
+      if (editing) {
+        await characterApi.update(projectId, editing.id, payload);
+        toast.success("角色已更新");
+      } else {
+        await characterApi.create(projectId, payload);
+        toast.success("角色已创建");
       }
-      await characterApi.create(projectId, payload);
-      toast.success("角色已创建");
-      setShowCreate(false);
-      setForm(EMPTY_FORM);
-      loadCharacters();
+      setFormOpen(false);
+      setEditing(null);
+      await loadCharacters();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "创建失败");
+      toast.error(e instanceof Error ? e.message : editing ? "更新失败" : "创建失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDelete = async (characterId: string) => {
+    if (!projectId) return;
+    const target = characters.find((c) => c.id === characterId);
+    if (!window.confirm(`确定删除角色"${target?.name ?? ""}"？`)) return;
+    try {
+      await characterApi.delete(projectId, characterId);
+      toast.success("角色已删除");
+      await loadCharacters();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "删除失败");
     }
   };
 
   const handleAIGenerate = async () => {
-    if (!projectId) return;
-    if (!aiDescription.trim()) {
+    if (!projectId || aiGenerating) return;
+    const description = aiDescription.trim();
+    if (!description) {
       toast.error("请描述你想生成的角色的特征");
       return;
     }
     setAiGenerating(true);
     try {
-      await characterApi.aiGenerate(projectId, aiDescription.trim());
+      await characterApi.aiGenerate(projectId, description);
       toast.success("AI 角色已生成");
       setAiDescription("");
-      loadCharacters();
+      await loadCharacters();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "AI 生成失败");
     } finally {
@@ -136,12 +217,12 @@ export default function CharactersPage() {
   };
 
   const handleGenerateImage = async (characterId: string) => {
-    if (!projectId) return;
+    if (!projectId || generatingId) return;
     setGeneratingId(characterId);
     try {
       await characterApi.generateImage(projectId, characterId);
-      toast.success("形象已生成并追加");
-      loadCharacters();
+      toast.success("角色形象已生成");
+      await loadCharacters();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "形象生成失败");
     } finally {
@@ -149,215 +230,277 @@ export default function CharactersPage() {
     }
   };
 
-  const handleDelete = async (characterId: string) => {
-    if (!projectId) return;
-    if (!window.confirm("确定删除该角色？")) return;
-    try {
-      await characterApi.delete(projectId, characterId);
-      toast.success("角色已删除");
-      loadCharacters();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "删除失败");
-    }
-  };
-
-  if (!currentProject) {
+  if (!project) {
     return (
-      <div className="max-w-7xl mx-auto">
-        <div className="card p-10 text-center text-surface-400">
-          请先在首页新建或选择一个项目，再进行角色管理
-        </div>
+      <div className="max-w-3xl mx-auto mt-20 card p-10 text-center space-y-4">
+        <Sparkles size={36} className="mx-auto text-surface-300" />
+        <p className="text-surface-500">
+          {projectLoading
+            ? "正在加载项目列表…"
+            : projectError ?? "先在首页新建或选择一个项目，再回来管理角色。"}
+        </p>
+        <Link href="/" className="btn-primary inline-flex">
+          去选择项目
+        </Link>
       </div>
     );
   }
 
   return (
     <div className="max-w-7xl mx-auto space-y-6 animate-fade-in">
-      <div className="flex items-center justify-between flex-wrap gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-surface-900">角色管理</h1>
-          <p className="text-surface-500 mt-1">
-            项目《{currentProject.title}》· 创建和管理角色，AI 生成角色形象
+          <p className="text-sm text-surface-500 mt-1">
+            当前项目：{project.title} · 共 {characters.length} 个角色
           </p>
         </div>
-        <div className="flex gap-3">
+        <button
+          onClick={openCreate}
+          className="btn-primary flex items-center gap-2 text-sm"
+        >
+          <Plus size={16} />
+          新建角色
+        </button>
+      </div>
+
+      {error && (
+        <div className="flex items-start gap-2 rounded-lg bg-red-50 border border-red-200 p-3 text-sm text-red-700">
+          <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
+          <span className="flex-1">{error}</span>
+          <button onClick={() => void loadCharacters()} className="text-xs underline">
+            重试
+          </button>
+        </div>
+      )}
+
+      {/* AI 生成角色 */}
+      <div className="card p-5 space-y-3">
+        <div className="flex items-center gap-2">
+          <Sparkles size={18} className="text-primary-600" />
+          <h2 className="font-medium text-surface-800">AI 生成角色</h2>
+          <span className="text-xs text-surface-400">
+            描述角色特征，AI 生成设定与形象（消耗配额）
+          </span>
+        </div>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <input
+            value={aiDescription}
+            onChange={(e) => setAiDescription(e.target.value)}
+            placeholder="例如：28 岁女律师，冷静理性，因一场旧案与男主重逢"
+            maxLength={5000}
+            className="input-field flex-1"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void handleAIGenerate();
+            }}
+          />
           <button
-            onClick={() => setShowCreate((v) => !v)}
-            className="btn-outline flex items-center gap-2"
+            onClick={() => void handleAIGenerate()}
+            disabled={aiGenerating || !aiDescription.trim()}
+            className="btn-primary flex items-center justify-center gap-2 text-sm disabled:opacity-60"
           >
-            <Plus size={16} />
-            新建角色
+            {aiGenerating ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : (
+              <Sparkles size={16} />
+            )}
+            {aiGenerating ? "生成中…" : "生成角色"}
           </button>
         </div>
       </div>
 
-      {/* AI 生成 */}
-      <div className="card p-4 flex gap-3 items-center flex-wrap">
-        <Sparkles size={18} className="text-primary-500 flex-shrink-0" />
-        <input
-          type="text"
-          value={aiDescription}
-          onChange={(e) => setAiDescription(e.target.value)}
-          placeholder="描述你想 AI 生成的角色，如：25岁天才黑客少女，性格倔强，喜欢穿黑色卫衣..."
-          className="input-field flex-1 min-w-[260px]"
-        />
-        <button
-          onClick={handleAIGenerate}
-          disabled={aiGenerating}
-          className="btn-primary flex items-center gap-2 disabled:opacity-60"
-        >
-          {aiGenerating ? (
-            <Loader2 size={16} className="animate-spin" />
-          ) : (
-            <Sparkles size={16} />
-          )}
-          {aiGenerating ? "生成中..." : "AI 生成角色"}
-        </button>
-      </div>
-
-      {/* 新建角色表单 */}
-      {showCreate && (
-        <div className="card p-5">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="font-semibold text-surface-800">新建角色</h2>
-            <button
-              onClick={() => setShowCreate(false)}
-              className="p-1 rounded-md hover:bg-surface-100 text-surface-400"
-            >
-              <X size={16} />
-            </button>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs text-surface-500 mb-1">角色名 *</label>
-              <input
-                value={form.name}
-                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                placeholder="如：林小满"
-                className="input-field"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-surface-500 mb-1">定位</label>
-              <input
-                value={form.role}
-                onChange={(e) => setForm((f) => ({ ...f, role: e.target.value }))}
-                placeholder="如：女主角"
-                className="input-field"
-              />
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs text-surface-500 mb-1">角色描述</label>
-              <textarea
-                value={form.description}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, description: e.target.value }))
-                }
-                placeholder="性格、背景、外貌等"
-                rows={3}
-                className="input-field resize-none"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-surface-500 mb-1">声线</label>
-              <input
-                value={form.voice}
-                onChange={(e) => setForm((f) => ({ ...f, voice: e.target.value }))}
-                placeholder="如：青年女声·温柔"
-                className="input-field"
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs text-surface-500 mb-1">年龄</label>
-                <input
-                  type="number"
-                  value={form.age}
-                  onChange={(e) => setForm((f) => ({ ...f, age: e.target.value }))}
-                  placeholder="如：22"
-                  className="input-field"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-surface-500 mb-1">性别</label>
-                <select
-                  value={form.gender}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, gender: e.target.value }))
-                  }
-                  className="input-field"
-                >
-                  <option value="male">男</option>
-                  <option value="female">女</option>
-                  <option value="other">其他</option>
-                </select>
-              </div>
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs text-surface-500 mb-1">
-                性格标签（逗号分隔）
-              </label>
-              <input
-                value={form.traits}
-                onChange={(e) => setForm((f) => ({ ...f, traits: e.target.value }))}
-                placeholder="如：执着, 冷静, 重情义"
-                className="input-field"
-              />
-            </div>
-          </div>
-          <div className="flex justify-end gap-3 mt-4">
-            <button
-              onClick={() => setShowCreate(false)}
-              className="btn-outline"
-            >
-              取消
-            </button>
-            <button onClick={handleCreate} className="btn-primary">
-              创建角色
-            </button>
-          </div>
+      {/* 搜索 */}
+      {characters.length > 0 && (
+        <div className="relative max-w-sm">
+          <Search
+            size={16}
+            className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400"
+          />
+          <input
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            placeholder="搜索角色名、定位、特质…"
+            className="input-field w-full pl-9"
+          />
         </div>
       )}
 
-      {/* 搜索 */}
-      <div className="relative max-w-md">
-        <Search
-          size={18}
-          className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400"
-        />
-        <input
-          type="text"
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          placeholder="搜索角色名称、定位..."
-          className="input-field pl-10"
-        />
-      </div>
-
-      {/* 角色网格 */}
-      {loading ? (
-        <div className="flex items-center justify-center py-16 text-surface-400">
-          <Loader2 size={20} className="animate-spin mr-2" />
-          加载中...
+      {loading && characters.length === 0 ? (
+        <div className="card p-10 flex items-center justify-center gap-2 text-sm text-surface-500">
+          <Loader2 size={16} className="animate-spin" />
+          加载角色中…
+        </div>
+      ) : characters.length === 0 ? (
+        <div className="card p-10 text-center space-y-3">
+          <Sparkles size={30} className="mx-auto text-surface-300" />
+          <p className="text-surface-500">还没有角色</p>
+          <p className="text-xs text-surface-400">
+            用上方 AI 生成，或点击「新建角色」手动创建
+          </p>
+          <button onClick={openCreate} className="btn-outline inline-flex items-center gap-2 text-sm">
+            <Plus size={14} />
+            新建角色
+          </button>
         </div>
       ) : filtered.length === 0 ? (
-        <div className="card p-10 text-center text-surface-400">
-          {characters.length === 0
-            ? "还没有角色，点击上方按钮新建或 AI 生成"
-            : "没有匹配的角色"}
+        <div className="card p-10 text-center space-y-3">
+          <p className="text-surface-500">没有匹配「{searchTerm}」的角色</p>
+          <button onClick={() => setSearchTerm("")} className="btn-outline text-sm">
+            清除搜索
+          </button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
           {filtered.map((character) => (
             <CharacterCard
               key={character.id}
               character={character}
               traitColors={traitColors}
-              onGenerateImage={handleGenerateImage}
+              onEdit={() => openEdit(character)}
               onDelete={handleDelete}
+              onGenerateImage={handleGenerateImage}
               generating={generatingId === character.id}
             />
           ))}
+        </div>
+      )}
+
+      {/* 新建 / 编辑弹窗 */}
+      {formOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={closeForm}
+        >
+          <div
+            className="card w-full max-w-2xl max-h-[90vh] overflow-y-auto p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="font-semibold text-surface-800">
+                {editing ? `编辑角色 · ${editing.name}` : "新建角色"}
+              </h2>
+              <button
+                onClick={closeForm}
+                className="p-1.5 rounded-md hover:bg-surface-100 text-surface-400"
+                title="关闭"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <label className="space-y-1 block">
+                <span className="text-xs text-surface-500">角色名 *</span>
+                <input
+                  value={form.name}
+                  onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  placeholder="角色姓名"
+                  className="input-field w-full"
+                />
+              </label>
+              <label className="space-y-1 block">
+                <span className="text-xs text-surface-500">角色定位</span>
+                <select
+                  value={form.role}
+                  onChange={(e) => setForm({ ...form, role: e.target.value })}
+                  className="input-field w-full"
+                >
+                  {ROLE_OPTIONS.map((role) => (
+                    <option key={role} value={role}>
+                      {role}
+                    </option>
+                  ))}
+                  {form.role &&
+                    !ROLE_OPTIONS.includes(form.role as (typeof ROLE_OPTIONS)[number]) && (
+                      <option value={form.role}>{roleLabel(form.role)}</option>
+                    )}
+                </select>
+              </label>
+              <label className="space-y-1 block">
+                <span className="text-xs text-surface-500">性别</span>
+                <select
+                  value={form.gender}
+                  onChange={(e) => setForm({ ...form, gender: e.target.value })}
+                  className="input-field w-full"
+                >
+                  {GENDER_OPTIONS.map((g) => (
+                    <option key={g.value} value={g.value}>
+                      {g.label}
+                    </option>
+                  ))}
+                  {form.gender &&
+                    !GENDER_OPTIONS.some((g) => g.value === form.gender) && (
+                      <option value={form.gender}>{form.gender}</option>
+                    )}
+                </select>
+              </label>
+              <label className="space-y-1 block">
+                <span className="text-xs text-surface-500">年龄</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={form.age}
+                  onChange={(e) => setForm({ ...form, age: e.target.value })}
+                  placeholder="0 表示未设置"
+                  className="input-field w-full"
+                />
+              </label>
+              <label className="space-y-1 block">
+                <span className="text-xs text-surface-500">音色</span>
+                <input
+                  value={form.voice}
+                  onChange={(e) => setForm({ ...form, voice: e.target.value })}
+                  placeholder="例如：低沉磁性"
+                  className="input-field w-full"
+                />
+              </label>
+              <label className="space-y-1 block">
+                <span className="text-xs text-surface-500">特质（用逗号分隔）</span>
+                <input
+                  value={form.traits}
+                  onChange={(e) => setForm({ ...form, traits: e.target.value })}
+                  placeholder="冷静、执着、重情义"
+                  className="input-field w-full"
+                />
+              </label>
+            </div>
+
+            <label className="space-y-1 block">
+              <span className="text-xs text-surface-500">角色描述</span>
+              <textarea
+                value={form.description}
+                onChange={(e) => setForm({ ...form, description: e.target.value })}
+                rows={3}
+                placeholder="外貌、性格、人物关系…"
+                className="input-field w-full resize-y"
+              />
+            </label>
+
+            <label className="space-y-1 block">
+              <span className="text-xs text-surface-500">背景故事</span>
+              <textarea
+                value={form.backstory}
+                onChange={(e) => setForm({ ...form, backstory: e.target.value })}
+                rows={3}
+                placeholder="角色的前史与动机（可选）"
+                className="input-field w-full resize-y"
+              />
+            </label>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button onClick={closeForm} disabled={submitting} className="btn-outline text-sm">
+                取消
+              </button>
+              <button
+                onClick={() => void handleSubmit()}
+                disabled={submitting || !form.name.trim()}
+                className="btn-primary flex items-center gap-2 text-sm disabled:opacity-60"
+              >
+                {submitting && <Loader2 size={14} className="animate-spin" />}
+                {editing ? "保存修改" : "创建角色"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

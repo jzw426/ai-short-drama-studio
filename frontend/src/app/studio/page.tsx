@@ -1,26 +1,45 @@
 "use client";
 
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  Clapperboard,
   FileText,
   Layout,
+  Loader2,
+  RefreshCw,
   Users,
-  Clapperboard,
-  CheckCircle2,
-  ArrowRight,
 } from "lucide-react";
-import { useShallow } from "zustand/shallow";
-import { useProjectStore, selectScriptStats } from "@/store/useProjectStore";
+import { toast } from "sonner";
+
+import {
+  characterApi,
+  renderApi,
+  scriptApi,
+  storyboardApi,
+  type CharacterDto,
+  type RenderTaskDto,
+  type SceneDto,
+  type ScriptDto,
+  type ShotDto,
+} from "@/lib/api";
+import { useCurrentProject } from "@/lib/useCurrentProject";
 
 interface WorkflowStepDef {
-  id: string;
+  id: "script" | "storyboard" | "characters" | "render";
   label: string;
   description: string;
   icon: React.ElementType;
   href: string;
+  count: number;
+  done: boolean;
+  summary: string;
 }
 
-const STEPS: WorkflowStepDef[] = [
+const STEP_META: Omit<WorkflowStepDef, "count" | "done" | "summary">[] = [
   {
     id: "script",
     label: "剧本工坊",
@@ -51,104 +70,208 @@ const STEPS: WorkflowStepDef[] = [
   },
 ];
 
-function getStepStatus(
-  stepId: string,
-  scriptSceneCount: number,
-  storyboardSaved: boolean,
-  workflowSteps: { script: boolean; storyboard: boolean; characters: boolean; render: boolean }
-): "completed" | "active" | "pending" {
-  if (workflowSteps[stepId as keyof typeof workflowSteps]) return "completed";
-
-  switch (stepId) {
-    case "script":
-      return scriptSceneCount > 0 ? "active" : "pending";
-    case "storyboard":
-      return scriptSceneCount > 0 ? "active" : "pending";
-    case "characters":
-      return storyboardSaved || scriptSceneCount > 0 ? "pending" : "pending";
-    case "render":
-      return "pending";
-    default:
-      return "pending";
-  }
-}
+const RENDER_STATUS_LABEL: Record<RenderTaskDto["status"], string> = {
+  queued: "排队中",
+  processing: "渲染中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 
 export default function StudioPage() {
-  const scriptScenes = useProjectStore((s) => s.scriptScenes);
-  const storyboardCanvasState = useProjectStore((s) => s.storyboardCanvasState);
-  const workflowSteps = useProjectStore((s) => s.workflowSteps);
-  const currentProject = useProjectStore((s) => s.currentProject);
-  const stats = useProjectStore(useShallow(selectScriptStats));
+  const { project, loading: projectLoading, error: projectError } = useCurrentProject();
+  const projectId = project?.id ?? null;
 
-  const storyboardSaved = storyboardCanvasState !== null;
-  const sceneCount = scriptScenes.length;
+  const [scenes, setScenes] = useState<SceneDto[]>([]);
+  const [shots, setShots] = useState<ShotDto[]>([]);
+  const [characters, setCharacters] = useState<CharacterDto[]>([]);
+  const [renderTasks, setRenderTasks] = useState<RenderTaskDto[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!projectId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const [script, shotList, characterList, tasks] = await Promise.all([
+        scriptApi.get(projectId) as Promise<unknown>,
+        storyboardApi.listShots(projectId) as Promise<unknown>,
+        characterApi.list(projectId) as Promise<unknown>,
+        renderApi.list(projectId) as Promise<unknown>,
+      ]);
+      const scriptDto = script as ScriptDto | null;
+      setScenes(Array.isArray(scriptDto?.scenes) ? scriptDto!.scenes : []);
+      setShots(Array.isArray(shotList) ? (shotList as ShotDto[]) : []);
+      setCharacters(
+        Array.isArray(characterList) ? (characterList as CharacterDto[]) : []
+      );
+      setRenderTasks(Array.isArray(tasks) ? (tasks as RenderTaskDto[]) : []);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "加载项目统计失败";
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (projectId) void load();
+    else {
+      setScenes([]);
+      setShots([]);
+      setCharacters([]);
+      setRenderTasks([]);
+      setError(null);
+    }
+  }, [projectId, load]);
+
+  const scriptStats = useMemo(() => {
+    let dialogueCount = 0;
+    let chars = 0;
+    for (const scene of scenes) {
+      dialogueCount += scene.dialogue
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean).length;
+      chars += Array.from(
+        `${scene.title}${scene.location}${scene.summary}${scene.content}${scene.dialogue}`
+      ).length;
+    }
+    return { dialogueCount, chars };
+  }, [scenes]);
+
+  const completedRenderCount = renderTasks.filter((t) => t.status === "completed").length;
+  const latestRender = renderTasks[0];
+
+  const steps: WorkflowStepDef[] = useMemo(() => {
+    const values: Record<WorkflowStepDef["id"], { count: number; done: boolean; summary: string }> = {
+      script: {
+        count: scenes.length,
+        done: scenes.length > 0,
+        summary:
+          scenes.length > 0
+            ? `对白 ${scriptStats.dialogueCount} 条 · 字数 ${scriptStats.chars}`
+            : "尚未创建场景",
+      },
+      storyboard: {
+        count: shots.length,
+        done: shots.length > 0,
+        summary: shots.length > 0 ? `共 ${shots.length} 个镜头` : "尚未生成镜头",
+      },
+      characters: {
+        count: characters.length,
+        done: characters.length > 0,
+        summary: characters.length > 0 ? `共 ${characters.length} 个角色` : "前往角色管理创建",
+      },
+      render: {
+        count: renderTasks.length,
+        done: completedRenderCount > 0,
+        summary:
+          latestRender != null
+            ? `最近任务：${RENDER_STATUS_LABEL[latestRender.status] ?? latestRender.status}`
+            : "尚未提交渲染",
+      },
+    };
+    return STEP_META.map((meta) => ({ ...meta, ...values[meta.id] }));
+  }, [scenes.length, shots.length, characters.length, scriptStats, renderTasks.length, completedRenderCount, latestRender]);
+
+  const firstIncomplete = steps.find((s) => !s.done)?.id ?? null;
+
+  const getStepStatus = (step: WorkflowStepDef): "completed" | "active" | "pending" => {
+    if (step.done) return "completed";
+    if (step.id === firstIncomplete) return "active";
+    return "pending";
+  };
+
+  const isInitialLoading = loading && scenes.length === 0 && shots.length === 0 && characters.length === 0;
+
+  if (!project) {
+    return (
+      <div className="max-w-3xl mx-auto mt-20 card p-10 text-center space-y-4">
+        <FileText size={36} className="mx-auto text-surface-300" />
+        <p className="text-surface-500">
+          {projectLoading
+            ? "正在加载项目列表…"
+            : projectError ?? "先在首页新建或选择一个项目，再开始创作。"}
+        </p>
+        <Link href="/" className="btn-primary inline-flex">
+          去选择项目
+        </Link>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-7xl mx-auto space-y-8 animate-fade-in">
-      <div>
-        <h1 className="text-2xl font-bold text-surface-900">创作工作台</h1>
-        <p className="text-surface-500 mt-1">
-          {currentProject
-            ? `当前项目：${currentProject.title}`
-            : "按照流程指引完成短剧创作，从剧本到成片一步到位"}
-        </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-surface-900">创作工作台</h1>
+          <p className="text-surface-500 mt-1">当前项目：{project.title}</p>
+        </div>
+        <button
+          onClick={() => void load()}
+          disabled={loading}
+          className="btn-outline flex items-center gap-1.5 text-sm disabled:opacity-60"
+        >
+          <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+          刷新
+        </button>
       </div>
 
+      {error && (
+        <div className="flex items-start gap-2 rounded-lg bg-red-50 border border-red-200 p-3 text-sm text-red-700">
+          <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
+          <span className="flex-1">{error}</span>
+          <button onClick={() => void load()} className="text-xs underline">
+            重试
+          </button>
+        </div>
+      )}
+
       {/* 实时统计卡片 */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard
-          icon={<FileText size={20} className="text-primary-600" />}
-          label="场景数"
-          value={sceneCount.toString()}
-          sub={
-            sceneCount > 0
-              ? `对白 ${stats.dialogueCount} · 字数 ${stats.totalChars}`
-              : "尚未创建场景"
-          }
-        />
-        <StatCard
-          icon={<Layout size={20} className="text-purple-600" />}
-          label="分镜状态"
-          value={storyboardSaved ? "已保存" : "未保存"}
-          sub={
-            storyboardSaved
-              ? "画布数据已持久化"
-              : "进入分镜设计开始编排"
-          }
-        />
-        <StatCard
-          icon={<Users size={20} className="text-amber-600" />}
-          label="角色数"
-          value={useProjectStore((s) => s.projects.length > 0 ? "3" : "0")}
-          sub="前往角色管理创建"
-        />
-        <StatCard
-          icon={<Clapperboard size={20} className="text-green-600" />}
-          label="渲染任务"
-          value={useProjectStore((s) => s.workflowSteps.render ? "1" : "0")}
-          sub="完成前序步骤后可用"
-        />
-      </div>
+      {isInitialLoading ? (
+        <div className="card p-8 flex items-center justify-center gap-2 text-sm text-surface-500">
+          <Loader2 size={16} className="animate-spin" />
+          正在统计项目数据…
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {steps.map((step) => (
+            <StatCard
+              key={step.id}
+              icon={<step.icon size={20} className="text-primary-600" />}
+              label={
+                step.id === "script"
+                  ? "场景数"
+                  : step.id === "storyboard"
+                  ? "镜头数"
+                  : step.id === "characters"
+                  ? "角色数"
+                  : "渲染任务"
+              }
+              value={String(step.count)}
+              sub={step.summary}
+            />
+          ))}
+        </div>
+      )}
 
       {/* 工作流进度 */}
       <section className="card p-6">
-        <h2 className="text-lg font-semibold text-surface-800 mb-6">
-          创作流程
-        </h2>
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-lg font-semibold text-surface-800">创作流程</h2>
+          <Link href="/" className="text-xs text-surface-400 hover:text-primary-600">
+            切换项目
+          </Link>
+        </div>
         <div className="flex items-center justify-between">
-          {STEPS.map((step, index) => {
-            const status = getStepStatus(
-              step.id,
-              sceneCount,
-              storyboardSaved,
-              workflowSteps
-            );
+          {steps.map((step, index) => {
+            const status = getStepStatus(step);
             return (
               <div key={step.id} className="flex items-center flex-1">
-                <Link
-                  href={step.href}
-                  className="flex flex-col items-center gap-3 group"
-                >
+                <Link href={step.href} className="flex flex-col items-center gap-3 group">
                   <div
                     className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-300 ${
                       status === "completed"
@@ -164,9 +287,7 @@ export default function StudioPage() {
                       <step.icon
                         size={28}
                         className={
-                          status === "active"
-                            ? "text-primary-600"
-                            : "text-surface-400"
+                          status === "active" ? "text-primary-600" : "text-surface-400"
                         }
                       />
                     )}
@@ -192,7 +313,7 @@ export default function StudioPage() {
                     </p>
                   </div>
                 </Link>
-                {index < STEPS.length - 1 && (
+                {index < steps.length - 1 && (
                   <div className="flex-1 mx-4 h-0.5 bg-surface-200 relative">
                     <div
                       className={`absolute inset-y-0 left-0 transition-all duration-500 ${
@@ -213,17 +334,10 @@ export default function StudioPage() {
 
       {/* 全部模块卡片 */}
       <section>
-        <h2 className="text-lg font-semibold text-surface-800 mb-4">
-          全部模块
-        </h2>
+        <h2 className="text-lg font-semibold text-surface-800 mb-4">全部模块</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {STEPS.map((step) => {
-            const status = getStepStatus(
-              step.id,
-              sceneCount,
-              storyboardSaved,
-              workflowSteps
-            );
+          {steps.map((step) => {
+            const status = getStepStatus(step);
             return (
               <Link key={step.id} href={step.href} className="card p-5 group">
                 <div className="flex items-center justify-between mb-3">
@@ -253,9 +367,8 @@ export default function StudioPage() {
                   />
                 </div>
                 <h3 className="font-medium text-surface-800">{step.label}</h3>
-                <p className="text-sm text-surface-400 mt-1">
-                  {step.description}
-                </p>
+                <p className="text-sm text-surface-400 mt-1">{step.description}</p>
+                <p className="text-xs text-surface-500 mt-2">{step.summary}</p>
               </Link>
             );
           })}

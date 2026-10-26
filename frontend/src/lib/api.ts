@@ -87,6 +87,13 @@ export const scriptApi = {
     api.get(`/projects/${projectId}/script/scenes`),
   createScene: (projectId: string, data: Record<string, unknown>) =>
     api.post(`/projects/${projectId}/script/scenes`, data),
+  updateScene: (
+    projectId: string,
+    sceneId: string,
+    data: Record<string, unknown>
+  ) => api.put(`/projects/${projectId}/script/scenes/${sceneId}`, data),
+  deleteScene: (projectId: string, sceneId: string) =>
+    api.delete(`/projects/${projectId}/script/scenes/${sceneId}`),
   // 导出剧本（markdown/txt），返回原始文本
   exportText: async (
     projectId: string,
@@ -114,9 +121,14 @@ export const storyboardApi = {
     shotId: string,
     data: Record<string, unknown>
   ) => api.put(`/projects/${projectId}/storyboard/shots/${shotId}`, data),
+  deleteShot: (projectId: string, shotId: string) =>
+    api.delete(`/projects/${projectId}/storyboard/shots/${shotId}`),
   // 从剧本一键生成分镜（AI）
+  // 每个剧本场景一次 AI 调用，整体远超默认 30s 超时
   generateFromScript: (projectId: string) =>
-    api.post(`/projects/${projectId}/storyboard/generate-from-script`),
+    api.post(`/projects/${projectId}/storyboard/generate-from-script`, undefined, {
+      timeout: 330000,
+    }),
   // 导出分镜（JSON）
   exportJson: (projectId: string) =>
     api.get(`/projects/${projectId}/storyboard/export`),
@@ -194,14 +206,85 @@ export interface RenderTaskDto {
   cancel_requested: boolean;
 }
 
+/** 后端 ScriptResponse（snake_case） */
+export interface SceneDto {
+  id: string;
+  script_id: string;
+  scene_number: number;
+  title: string;
+  location: string;
+  time_of_day: string;
+  interior: boolean;
+  summary: string;
+  content: string;
+  /** 台词：渲染烧字幕的唯一正确来源 */
+  dialogue: string;
+  duration: number;
+  sort_order: number;
+}
+
+/** 后端 ScriptUpdate 只接受这三个字段，其余一律不发 */
+export interface ScriptUpdatePayload {
+  title?: string;
+  content?: string;
+  word_count?: number;
+}
+
+export interface ScriptDto {
+  id: string;
+  project_id: string;
+  title: string;
+  content: string;
+  word_count: number;
+  scenes: SceneDto[];
+  ai_prompt_history?: { id: string; prompt: string; response: string; timestamp: string }[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** 后端 AIGenerateResponse（剧本正文生成） */
+export interface AIGenerateTextDto {
+  generated_content: string;
+  prompt: string;
+  usage?: Record<string, unknown> | null;
+}
+
+/** 与后端 CharacterResponse 对齐（snake_case） */
+export interface CharacterDto {
+  id: string;
+  project_id: string;
+  name: string;
+  role: string;
+  description: string;
+  avatar_url: string | null;
+  generated_images?: string[];
+  voice: string;
+  age: number;
+  gender: string;
+  traits: string[];
+  backstory: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
 /** 后端 ShotResponse（snake_case） */
 export interface ShotDto {
   id: string;
+  storyboard_id: string;
   shot_number: number;
   label: string;
   description: string;
   duration: number;
+  /** 景别/角度：AI 返回中文（全景/中景/特写…），后端不限枚举 */
+  camera_angle: string;
+  /** 转场：AI 返回中文（硬切/淡入…），后端不限枚举 */
+  transition: string;
+  scene_ref?: string | null;
+  character_refs: string[];
+  /** 绑定的素材存储地址（canonical_url）；为空表示渲染时由 AI 生成 */
   video_url?: string | null;
+  sort_order: number;
+  created_at?: string;
 }
 
 export interface RenderStatusDto {

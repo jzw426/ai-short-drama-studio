@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import React, { useRef, useEffect, useState, useCallback } from "react";
 
@@ -21,7 +21,11 @@ import {
   MoveUp,
   MoveDown,
 } from "lucide-react";
-import { useProjectStore } from "@/store/useProjectStore";
+import {
+  useProjectStore,
+  selectCanUndo,
+  selectCanRedo,
+} from "@/store/useProjectStore";
 import { storyboardApi } from "@/lib/api";
 import type { StoryboardObjectInfo } from "@/store/useProjectStore";
 
@@ -153,7 +157,7 @@ function extractObjectInfo(obj: any): StoryboardObjectInfo {
 
 // ===== 主组件 =====
 
-export function StoryboardCanvas() {
+export function StoryboardCanvas({ sceneCount = 0 }: { sceneCount?: number }) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
   const fabricRef = useRef<any>(null);
   const fabricLibRef = useRef<any>(null);
@@ -162,11 +166,10 @@ export function StoryboardCanvas() {
   const [fabricReady, setFabricReady] = useState(false);
   const [zoom, setZoom] = useState(100);
   const [selectedInfo, setSelectedInfo] = useState<StoryboardObjectInfo | null>(null);
-  const [canUndo, setCanUndo] = useState(false);
-  const [canRedo, setCanRedo] = useState(false);
+  const canUndo = useProjectStore(selectCanUndo);
+  const canRedo = useProjectStore(selectCanRedo);
 
   const {
-    scriptScenes,
     currentProject,
     storyboardCanvasState,
     pushStoryboardUndo,
@@ -193,8 +196,6 @@ export function StoryboardCanvas() {
       if (stack[stack.length - 1] !== json) {
         pushStoryboardUndo(json);
       }
-      setCanUndo(true);
-      setCanRedo(false);
     } catch {
       // silent
     }
@@ -541,17 +542,14 @@ export function StoryboardCanvas() {
 
         // 保存初始状态（已从后端恢复则跳过）
         if (!useProjectStore.getState().storyboardCanvasState) {
-          setTimeout(() => {
-            try {
-              const json = JSON.stringify(
-                canvas.toJSON(["objectType", "customId", "sceneNumber", "excludeFromExport"])
-              );
-              pushStoryboardUndo(json);
-              setCanUndo(true);
-            } catch {
-              // silent
-            }
-          }, 100);
+          try {
+            const json = JSON.stringify(
+              canvas.toJSON(["objectType", "customId", "sceneNumber", "excludeFromExport"])
+            );
+            pushStoryboardUndo(json);
+          } catch {
+            // silent
+          }
         }
       })
       .catch((err: any) => {
@@ -602,13 +600,13 @@ export function StoryboardCanvas() {
     const existing = canvas
       .getObjects()
       .filter((o: any) => (o as any).objectType === "sceneBox").length;
-    const group = buildSceneBox(existing + 1, scriptScenes.length, fabric);
+    const group = buildSceneBox(existing + 1, sceneCount, fabric);
     (group as any).customId = generateObjectId();
     canvas.add(group);
     canvas.setActiveObject(group);
     canvas.renderAll();
     updateSelectionInfo(group);
-  }, [saveStateToUndoStack, updateSelectionInfo, scriptScenes.length]);
+  }, [saveStateToUndoStack, updateSelectionInfo, sceneCount]);
 
   const addCircle = useCallback(() => {
     const fabric = fabricLibRef.current;
@@ -821,8 +819,6 @@ export function StoryboardCanvas() {
         updateSelectionInfo(null);
         refreshLayers();
       });
-      setCanRedo(true);
-      setCanUndo(useProjectStore.getState().storyboardUndoStack.length > 0);
     }
   }, [undoStoryboard, updateSelectionInfo, refreshLayers, setStoryboardCanvasState]);
 
@@ -841,8 +837,6 @@ export function StoryboardCanvas() {
         updateSelectionInfo(null);
         refreshLayers();
       });
-      setCanUndo(true);
-      setCanRedo(useProjectStore.getState().storyboardRedoStack.length > 0);
     }
   }, [redoStoryboard, updateSelectionInfo, refreshLayers, setStoryboardCanvasState]);
 
@@ -902,16 +896,6 @@ export function StoryboardCanvas() {
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
   }, [handleUndo, handleRedo, deleteSelected]);
-
-  // 维持撤销/重做状态
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const state = useProjectStore.getState();
-      setCanUndo(state.storyboardUndoStack.length > 0);
-      setCanRedo(state.storyboardRedoStack.length > 0);
-    }, 200);
-    return () => clearInterval(interval);
-  }, []);
 
   // ===== 渲染 =====
   const computedWidth = selectedInfo

@@ -2,26 +2,16 @@
 
 import { User, Edit2, Mic, MoreHorizontal, ImagePlus, Loader2 } from "lucide-react";
 
-import { mediaUrl } from "@/lib/api";
+import { mediaUrl, type CharacterDto } from "@/lib/api";
+import { roleLabel } from "@/lib/labels";
 
 /** 与后端 CharacterResponse 字段对齐（snake_case） */
-export interface Character {
-  id: string;
-  name: string;
-  role: string;
-  description: string;
-  avatar_url: string | null;
-  voice: string;
-  age: number;
-  traits: string[];
-  gender: "male" | "female" | "other";
-  backstory: string;
-  generated_images?: string[];
-}
+export type Character = CharacterDto;
 
 interface CharacterCardProps {
   character: Character;
   traitColors: Record<string, string>;
+  onEdit?: (characterId: string) => void;
   onGenerateImage?: (characterId: string) => void;
   onDelete?: (characterId: string) => void;
   generating?: boolean;
@@ -30,6 +20,7 @@ interface CharacterCardProps {
 export function CharacterCard({
   character,
   traitColors,
+  onEdit,
   onGenerateImage,
   onDelete,
   generating,
@@ -64,9 +55,15 @@ export function CharacterCard({
               )}
             </button>
           )}
-          <button className="p-1.5 rounded-md hover:bg-surface-100 text-surface-400 hover:text-primary-600">
-            <Edit2 size={14} />
-          </button>
+          {onEdit && (
+            <button
+              onClick={() => onEdit(character.id)}
+              title="编辑角色"
+              className="p-1.5 rounded-md hover:bg-surface-100 text-surface-400 hover:text-primary-600"
+            >
+              <Edit2 size={14} />
+            </button>
+          )}
           {onDelete && (
             <button
               onClick={() => onDelete(character.id)}
@@ -85,7 +82,7 @@ export function CharacterCard({
           {character.name}
         </h3>
         <span className="text-xs text-primary-600 font-medium bg-primary-50 px-2 py-0.5 rounded-full">
-          {character.role}
+          {roleLabel(character.role)}
         </span>
       </div>
 

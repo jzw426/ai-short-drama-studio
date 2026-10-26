@@ -24,12 +24,11 @@ export default function Providers({ children }: { children: React.ReactNode }) {
     if (stored) {
       try {
         const data = JSON.parse(stored);
-        useProjectStore.setState((prev) => ({
-          ...prev,
-          ...data,
-          scriptScenes: data.scriptScenes || [],
-          projects: data.projects || [],
-        }));
+        // 只恢复项目选择；剧本/分镜等业务数据一律以服务端为准
+        useProjectStore.setState({
+          projects: Array.isArray(data?.projects) ? data.projects : [],
+          currentProject: data?.currentProject ?? null,
+        });
       } catch {
         // 忽略解析错误
       }
@@ -39,10 +38,10 @@ export default function Providers({ children }: { children: React.ReactNode }) {
   // 监听 store 变化并持久化
   useEffect(() => {
     const unsubscribe = useProjectStore.subscribe((state) => {
-      const { scriptScenes, projects, currentProject, workflowSteps } = state;
+      const { projects, currentProject } = state;
       localStorage.setItem(
         "ai-drama-studio-store",
-        JSON.stringify({ scriptScenes, projects, currentProject, workflowSteps })
+        JSON.stringify({ projects, currentProject })
       );
     });
     return unsubscribe;
