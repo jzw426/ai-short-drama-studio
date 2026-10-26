@@ -64,7 +64,12 @@ class Settings(BaseSettings):
         p = Path(v).expanduser()
         if not p.is_absolute():
             p = _BACKEND_DIR / p
-        return str(p.resolve())
+        p = p.resolve()
+        # backend/data/ 是 .gitignore 的：CI 全新 clone / 新机器上没有这个目录，
+        # sqlite 会直接报 "unable to open database file"，alembic 与运行期都起不来。
+        # 这里统一保证父目录存在（幂等，代价可忽略）。
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return str(p)
 
     @property
     def DATABASE_URL(self) -> str:

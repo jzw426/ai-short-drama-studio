@@ -113,8 +113,8 @@ jobs:
           file: docker/Dockerfile.backend
           push: false
           tags: ai-drama-backend:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
       - name: frontend image
         uses: docker/build-push-action@v6
         with:
@@ -122,5 +122,5 @@ jobs:
           file: docker/Dockerfile.frontend
           push: false
           tags: ai-drama-frontend:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
