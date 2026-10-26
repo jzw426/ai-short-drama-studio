@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.core.config import settings
+from app.core.logging_config import configure_logging
 from app.core.database import engine, Base
 from app.core.deps import get_current_user
 from app.core.middleware import RequestLogMiddleware
@@ -18,6 +19,8 @@ from app.api.routes import (
     ops,
     media,
 )
+
+configure_logging()
 
 
 @asynccontextmanager

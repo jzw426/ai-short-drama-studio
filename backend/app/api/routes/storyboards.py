@@ -145,6 +145,7 @@ async def create_shot(
         transition=data.transition,
         scene_ref=data.scene_ref,
         character_refs=data.character_refs,
+        video_url=data.video_url,
         sort_order=data.sort_order,
     )
     db.add(shot)
@@ -346,6 +347,7 @@ async def export_storyboard(
                 "transition": s.transition,
                 "scene_ref": s.scene_ref,
                 "character_refs": s.character_refs or [],
+                "video_url": s.video_url or "",
             }
             for s in shots
         ],

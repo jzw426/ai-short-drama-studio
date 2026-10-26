@@ -13,6 +13,7 @@ import {
   Film,
 } from "lucide-react";
 import { RenderPanel } from "@/components/RenderPanel";
+import { ShotBindingPanel } from "@/components/ShotBindingPanel";
 import { mediaUrl, renderApi } from "@/lib/api";
 import type { RenderConfigPayload, RenderTaskDto } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
@@ -348,6 +349,16 @@ export default function RenderPage() {
               </div>
             )}
           </div>
+
+          <ShotBindingPanel
+            projectId={project.id}
+            onChanged={() => {
+              void renderApi
+                .shotCount(project.id)
+                .then((n) => setShotCount(n))
+                .catch(() => setShotCount(null));
+            }}
+          />
 
           <RenderPanel
             onSubmit={handleSubmit}

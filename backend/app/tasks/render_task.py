@@ -9,6 +9,7 @@ M1 第二刀重点修三处（原实现每一条都真实发生）：
 - **状态互踩**：进度回调无条件写 `status="processing"`，会把已取消/已完成的任务改回去。
 """
 import asyncio
+import logging
 
 from celery import shared_task
 from sqlalchemy import select
@@ -18,6 +19,11 @@ from app.core.config import settings
 from app.core.time_utils import utc_now
 from app.models.asset import RenderTask
 from app.services.render_service import RenderCancelled, render_service
+
+logger = logging.getLogger(__name__)
+
+# error_message 是 Text，但没有必要把整个 traceback 塞给前端；保留足够诊断的长度。
+MAX_ERROR_CHARS = 4000
 
 # 创建 Celery worker 专用的数据库引擎（兼容 SQLite 和 PostgreSQL）
 _engine_kwargs = {"echo": False}
@@ -90,7 +96,7 @@ async def _set_task_result(
             task.output_url = output_url
             task.progress = 100.0
         if error:
-            task.error_message = error
+            task.error_message = error[:MAX_ERROR_CHARS]
         await session.commit()
 
 
@@ -126,7 +132,7 @@ def execute_render(self, task_id: str):
     async def _run():
         task = await _load_task(task_id)
         if not task:
-            print(f"[Render Task] Task {task_id} not found")
+            logger.error("[Render Task] Task %s not found", task_id)
             return
         if task.status == "cancelled" or task.cancel_requested:
             await _set_task_result(task_id, "cancelled", error="用户取消")
@@ -137,8 +143,19 @@ def execute_render(self, task_id: str):
         resume = dict(task.checkpoint or {})
 
         async def progress_callback(progress: float, message: str):
+            # 进度以数据库为准（前端读的是 RenderTask.progress）。
+            # update_state 只是给 Flower / AsyncResult 看的附加信息：result backend
+            # 抖动（Redis 重启、eager 模式无 backend）绝不能把一次正在烧钱的
+            # 渲染打断——旧代码在这里抛 ConnectionError，任务会被整体判失败。
             await _update_task_progress(task_id, progress, message)
-            self.update_state(state="PROGRESS", meta={"progress": progress, "message": message})
+            if getattr(self.request, "is_eager", False):
+                return
+            try:
+                self.update_state(
+                    state="PROGRESS", meta={"progress": progress, "message": message}
+                )
+            except Exception as exc:  # noqa: BLE001 - 仅日志，不影响渲染
+                logger.debug("[Render Task] update_state 失败（忽略）: %s", exc)
 
         async def checkpoint_cb(data: dict):
             await _save_checkpoint(task_id, data)
@@ -165,17 +182,20 @@ def execute_render(self, task_id: str):
                     error=f"重试 {MAX_ATTEMPTS} 次仍失败: {exc}",
                 )
                 return
-            print(f"[Render Task] 第 {attempts} 次失败，60s 后重试（复用断点）: {exc}")
+            logger.warning(
+                "[Render Task] 第 %s 次失败，60s 后重试（复用断点）: %s", attempts, exc
+            )
             raise self.retry(exc=exc, countdown=60)
+
+        for warning in results.get("warnings") or []:
+            logger.info("[Render Task] %s warning: %s", task_id, warning)
 
         if results.get("output_url"):
             await _set_task_result(task_id, "completed", output_url=results["output_url"])
         else:
-            errors = results.get("errors", [])
-            await _set_task_result(
-                task_id,
-                "failed",
-                error="; ".join(errors) if errors else "渲染失败，未生成输出文件",
-            )
+            errors = list(results.get("errors") or [])
+            if not errors:
+                errors = ["渲染失败，未生成输出文件（详见 worker 日志）"]
+            await _set_task_result(task_id, "failed", error="; ".join(errors))
 
     asyncio.run(_run())

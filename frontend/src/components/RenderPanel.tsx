@@ -4,6 +4,8 @@ import { useState } from "react";
 import { Settings2, Monitor, Smartphone, Film, Loader2, Play } from "lucide-react";
 import type { RenderConfigPayload } from "@/lib/api";
 
+type SubtitleSource = "dialogue" | "description" | "label" | "none";
+
 interface RenderPanelProps {
   onSubmit: (config: RenderConfigPayload) => void | Promise<void>;
   submitting: boolean;
@@ -26,6 +28,7 @@ const aspectRatioOptions = [
 const styleOptions = ["电影级（Cinematic）", "纪录片风", "动漫风格", "复古胶片"];
 
 const subtitleSourceOptions = [
+  { value: "dialogue", label: "剧本台词（推荐）" },
   { value: "description", label: "镜头画面描述" },
   { value: "label", label: "镜头标签" },
   { value: "none", label: "不烧字幕" },
@@ -37,7 +40,7 @@ const DEFAULTS = {
   style: styleOptions[0],
   fps: 24,
   addSubtitles: true,
-  subtitleSource: "description" as "description" | "label" | "none",
+  subtitleSource: "dialogue" as SubtitleSource,
   addBGM: true,
 };
 
@@ -52,9 +55,8 @@ export function RenderPanel({
   const [selectedStyle, setSelectedStyle] = useState(DEFAULTS.style);
   const [fps, setFps] = useState(DEFAULTS.fps);
   const [addSubtitles, setAddSubtitles] = useState(DEFAULTS.addSubtitles);
-  const [subtitleSource, setSubtitleSource] = useState<
-    "description" | "label" | "none"
-  >(DEFAULTS.subtitleSource);
+  const [subtitleSource, setSubtitleSource] =
+    useState<SubtitleSource>(DEFAULTS.subtitleSource);
   const [addBGM, setAddBGM] = useState(DEFAULTS.addBGM);
 
   const reset = () => {
@@ -209,9 +211,7 @@ export function RenderPanel({
             <select
               value={subtitleSource}
               onChange={(e) =>
-                setSubtitleSource(
-                  e.target.value as "description" | "label" | "none"
-                )
+                setSubtitleSource(e.target.value as SubtitleSource)
               }
               className="input-field max-w-[220px]"
             >
@@ -222,7 +222,9 @@ export function RenderPanel({
               ))}
             </select>
             <span className="text-xs text-surface-400">
-              当前字幕取镜头字段，剧本台词尚未接入
+              {subtitleSource === "dialogue"
+                ? "按镜头的场景引用取剧本台词；没有台词的镜头回退画面描述"
+                : "取镜头字段；台词请选「剧本台词」"}
             </span>
           </div>
         )}

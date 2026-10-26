@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Literal, Optional, List
 from datetime import datetime
 
 
@@ -13,6 +13,10 @@ class AssetResponse(BaseModel):
     mime_type: str
     size: int
     url: str
+    # 不带签名的稳定存储地址（local: /uploads/<object>；minio: 桶内规范 URL）。
+    # 素材「绑定到镜头」时必须用这个值：url 是短期签名链接，存进 shots.video_url
+    # 后过期就再也取不到素材了。
+    canonical_url: Optional[str] = None
     thumbnail_url: Optional[str]
     tags: List[str]
     duration: Optional[float]
@@ -27,16 +31,29 @@ class AssetResponse(BaseModel):
 # ===== 渲染 =====
 
 class RenderConfigSchema(BaseModel):
-    resolution: str = "1920x1080"
-    aspect_ratio: str = "9:16"
-    fps: int = 24
+    """渲染参数。
+
+    M2 之前这些字段除了 add_subtitles/add_bgm/bgm_source 之外**全部被渲染链路忽略**
+    （分辨率永远跟输入走、帧率硬编码 24、画质与风格不影响任何一帧）。现在每一项都
+    有明确语义，见 `backend/app/services/render_service.py` 的 _build_spec：
+
+    * resolution + aspect_ratio → 统一画布（不匹配时按 aspect_ratio 取长边重算，
+      scale 后 pad 黑边，绝不裁剪用户画面）。
+    * fps → 归一化帧率，也是成片帧率。
+    * quality → H.264 CRF/preset（low/medium/high）。
+    * visual_style → 归一化时套用的轻量调色（未知风格不调色，不做假动作）。
+    * subtitle_source → dialogue（剧本台词，正解）/ description（画面描述，历史行为）/ label / none。
+    """
+
+    resolution: str = Field(default="1920x1080", pattern=r"^\d{3,4}x\d{3,4}$")
+    aspect_ratio: str = Field(default="9:16", pattern=r"^\d{1,2}:\d{1,2}$")
+    fps: int = Field(default=24, ge=12, le=60)
     visual_style: str = "电影级（Cinematic）"
     add_subtitles: bool = True
-    # 字幕文本来源：description=镜头画面描述（历史行为，语义上不准确）/ label=镜头标签 / none=不烧字幕
-    subtitle_source: str = "description"
+    subtitle_source: Literal["dialogue", "description", "label", "none"] = "dialogue"
     add_bgm: bool = True
-    bgm_source: Optional[str] = None
-    quality: str = "high"
+    bgm_source: Optional[str] = Field(default=None, max_length=2048)
+    quality: Literal["low", "medium", "high"] = "high"
     ai_model: str = "kling"
 
 

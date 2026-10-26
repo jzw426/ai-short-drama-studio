@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 from app.core.time_utils import utc_now
-from sqlalchemy import String, Text, DateTime, Integer, Float, JSON, Boolean, ForeignKey
+from sqlalchemy import (
+    String, Text, DateTime, Integer, Float, JSON, Boolean, ForeignKey, Index, text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
@@ -32,6 +34,18 @@ class Asset(Base):
 
 class RenderTask(Base):
     __tablename__ = "render_tasks"
+    # 幂等键唯一约束（部分索引：只约束非 NULL）。旧实现靠"先查后插"，并发下
+    # 两个请求都能通过检查，各排一次队、各烧一遍 AI 钱。
+    __table_args__ = (
+        Index(
+            "uq_render_tasks_project_idempotency",
+            "project_id",
+            "idempotency_key",
+            unique=True,
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())

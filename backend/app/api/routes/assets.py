@@ -1,7 +1,16 @@
 import os
 import tempfile
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 
@@ -64,29 +73,44 @@ def _determine_asset_type(mime_type: str) -> str:
 @router.get("/projects/{project_id}/assets", response_model=List[AssetResponse])
 async def list_assets(
     project_id: str,
-    asset_type: Optional[str] = None,
-    search: Optional[str] = None,
+    response: Response,
+    asset_type: Optional[str] = Query(None, max_length=20),
+    search: Optional[str] = Query(None, max_length=200),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取项目素材列表"""
-    from sqlalchemy import select
+    """获取项目素材列表（分页；总数在 X-Total-Count 头里）"""
+    from sqlalchemy import func, select
 
     await _get_project_or_404(project_id, current_user.id, db)
 
-    stmt = select(Asset).where(Asset.project_id == project_id)
-
+    filters = [Asset.project_id == project_id]
     if asset_type:
-        stmt = stmt.where(Asset.type == asset_type)
-
+        filters.append(Asset.type == asset_type)
     if search:
-        stmt = stmt.where(Asset.name.ilike(f"%{search}%"))
+        filters.append(Asset.name.ilike(f"%{search}%"))
 
-    stmt = stmt.order_by(Asset.uploaded_at.desc())
+    total = (
+        await db.execute(select(func.count()).select_from(Asset).where(*filters))
+    ).scalar_one()
+
+    stmt = (
+        select(Asset)
+        .where(*filters)
+        .order_by(Asset.uploaded_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
 
     result = await db.execute(stmt)
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
     responses = [AssetResponse.model_validate(a) for a in result.scalars().all()]
     for resp in responses:
+        resp.canonical_url = resp.url
         # M1：MinIO 私有桶下签名变成"生成预签名 URL"，是异步的
         resp.url = await signed_media_url(resp.url) or resp.url
         resp.thumbnail_url = await signed_media_url(resp.thumbnail_url)
@@ -174,6 +198,7 @@ async def upload_asset(
     await db.refresh(asset)
 
     resp = AssetResponse.model_validate(asset)
+    resp.canonical_url = resp.url
     resp.url = await signed_media_url(resp.url) or resp.url
     return resp
 

@@ -14,6 +14,8 @@ class ShotCreate(BaseModel):
     transition: str = "cut"
     scene_ref: Optional[str] = None
     character_refs: List[str] = []
+    # 镜头素材规范 URL；为空则渲染回退 AI 视频生成
+    video_url: Optional[str] = Field(default=None, max_length=2048)
     sort_order: int = 0
 
 
@@ -26,6 +28,7 @@ class ShotUpdate(BaseModel):
     transition: Optional[str] = None
     scene_ref: Optional[str] = None
     character_refs: Optional[List[str]] = None
+    video_url: Optional[str] = Field(default=None, max_length=2048)
     sort_order: Optional[int] = None
 
 
@@ -40,6 +43,7 @@ class ShotResponse(BaseModel):
     transition: str
     scene_ref: Optional[str]
     character_refs: List[str]
+    video_url: Optional[str] = None
     sort_order: int
     created_at: datetime
 

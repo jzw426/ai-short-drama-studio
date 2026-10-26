@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     CELERY_ACCEPT_CONTENT: str = '["json"]'
     # 提交任务到 broker 的最大等待时间（秒）；broker 不可达时快速失败而非挂起接口
     CELERY_SUBMIT_TIMEOUT: float = 5.0
+    # 本机没有 Redis 时的真实 worker 验证通道：broker 设为 filesystem:// 后，
+    # 队列文件落在该目录（producer 与 worker 必须指向同一目录）。
+    # 生产环境不要用 filesystem 传输（无持久化/无重投递保证）。
+    CELERY_FILESYSTEM_DIR: str = ""
 
     # 上传限制
     UPLOAD_MAX_SIZE_MB: int = 500

@@ -1,8 +1,9 @@
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 
 from app.core.config import settings
 from app.core.database import get_db
@@ -100,7 +101,33 @@ async def submit_render_task(
         checkpoint={},
     )
     db.add(render_task)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # (project_id, idempotency_key) 部分唯一索引在并发提交时兜底：两个请求
+        # 同时通过了上面的"先查"，这里只会有一个插入成功。失败方改为返回已存在
+        # 的任务，而不是 500 —— 更不能各排一次队（每次排队都是真金白银）。
+        await db.rollback()
+        if not data.idempotency_key:
+            raise
+        existing = (
+            (
+                await db.execute(
+                    select(RenderTask)
+                    .where(
+                        RenderTask.project_id == project_id,
+                        RenderTask.idempotency_key == data.idempotency_key,
+                    )
+                    .order_by(RenderTask.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if not existing:
+            raise HTTPException(status_code=409, detail="重复的渲染提交，请重试")
+        response.status_code = 200
+        return await _task_response(existing)
 
     # 提交 Celery 异步任务，并保存真实 celery task id 供取消使用
     # 注意：broker 不可达时 delay() 可能长时间重试，必须加超时保护，避免接口被挂死
@@ -142,16 +169,37 @@ async def get_render_status(
 @router.get("/projects/{project_id}/render/tasks", response_model=List[RenderTaskResponse])
 async def list_render_tasks(
     project_id: str,
+    response: Response,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None, max_length=20),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取项目的所有渲染任务"""
+    """获取项目的渲染任务（分页；总数在 X-Total-Count 头里）。
+
+    旧实现无分页，一条项目跑上几十次渲染后这个接口会把全部任务和它们的大
+    config JSON 一起返回。
+    """
     await _get_project_or_404(project_id, current_user.id, db)
+
+    filters = [RenderTask.project_id == project_id]
+    if status:
+        filters.append(RenderTask.status == status)
+
+    total = (
+        await db.execute(select(func.count()).select_from(RenderTask).where(*filters))
+    ).scalar_one()
     result = await db.execute(
         select(RenderTask)
-        .where(RenderTask.project_id == project_id)
+        .where(*filters)
         .order_by(RenderTask.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
     return [await _task_response(t) for t in result.scalars().all()]
 
 

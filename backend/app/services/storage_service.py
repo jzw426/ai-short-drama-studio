@@ -49,10 +49,21 @@ class LocalStorage:
         return f"/uploads/{object_name}"
 
     async def upload_from_path(self, object_name: str, src_path: str, content_type: str = "") -> str:
-        """从磁盘文件入库（上传大文件时避免整包读进内存）。"""
+        """从磁盘文件入库（上传大文件时避免整包读进内存）。
+
+        注意：`os.replace` 只在同一卷内是原子改名，跨卷（临时目录在 C:、
+        存储目录在 D:/E:）会抛 OSError(WinError 17 / EXDEV) —— 旧实现直接失败，
+        表现就是"渲染跑完了但成片永远不落库"。跨卷时退化为复制后删除源文件。
+        """
         file_path = _secure_local_path(object_name)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        os.replace(src_path, file_path)
+        try:
+            os.replace(src_path, file_path)
+        except OSError:
+            import shutil
+
+            shutil.copyfile(src_path, file_path)
+            os.unlink(src_path)
         return f"/uploads/{object_name}"
 
     async def delete_file(self, object_name: str) -> None:

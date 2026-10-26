@@ -47,6 +47,9 @@ class Scene(Base):
     interior: Mapped[bool] = mapped_column(Boolean, default=True)
     summary: Mapped[str] = mapped_column(Text, default="")
     content: Mapped[str] = mapped_column(Text, default="")
+    # 台词（M2 新增）：渲染烧字幕的唯一正确来源。为空时 render_service 会尝试从
+    # content 的引号文本里提取；仍为空则回退画面描述并记为 warning。
+    dialogue: Mapped[str] = mapped_column(Text, default="")
     duration: Mapped[int] = mapped_column(Integer, default=0)  # seconds
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 

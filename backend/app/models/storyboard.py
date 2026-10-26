@@ -43,6 +43,11 @@ class Shot(Base):
     transition: Mapped[str] = mapped_column(String(100), default="cut")
     scene_ref: Mapped[str] = mapped_column(String(255), nullable=True)
     character_refs: Mapped[list] = mapped_column(JSON, default=list)
+    # 镜头素材（M2 新增）：该镜头要用的视频来源，规范媒体 URL
+    # （local: /uploads/{object_name}；minio: .../{bucket}/{object_name}）。
+    # 为空时渲染才回退到 AI 视频生成 —— 旧实现没有这一列，等于每个镜头都必须调用
+    # 付费 AI，没有 API Key 时系统永远出不了片。
+    video_url: Mapped[str] = mapped_column(String(2048), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 

@@ -13,6 +13,7 @@ class SceneCreate(BaseModel):
     interior: bool = True
     summary: str = ""
     content: str = ""
+    dialogue: str = ""
     duration: int = 0
     sort_order: int = 0
 
@@ -25,6 +26,7 @@ class SceneUpdate(BaseModel):
     interior: Optional[bool] = None
     summary: Optional[str] = None
     content: Optional[str] = None
+    dialogue: Optional[str] = None
     duration: Optional[int] = None
     sort_order: Optional[int] = None
 
@@ -39,6 +41,7 @@ class SceneResponse(BaseModel):
     interior: bool
     summary: str
     content: str
+    dialogue: str = ""
     duration: int
     sort_order: int
 

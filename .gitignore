@@ -96,3 +96,7 @@ backend/data/
 *.bak
 /*.docx
 backend/uvicorn_*.log
+
+# ---- M2（2026-10-26）----
+# Celery kombu filesystem 传输在 cwd 生成的 control 目录（运行产物）
+backend/control/

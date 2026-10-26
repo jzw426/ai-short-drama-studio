@@ -159,7 +159,8 @@ export interface RenderConfigPayload {
   fps: number;
   visual_style: string;
   add_subtitles: boolean;
-  subtitle_source: "description" | "label" | "none";
+  /** dialogue = 剧本台词（正解）；description = 画面描述（历史行为，读起来像旁白） */
+  subtitle_source: "dialogue" | "description" | "label" | "none";
   add_bgm: boolean;
   bgm_source?: string | null;
   quality: string;
@@ -191,6 +192,16 @@ export interface RenderTaskDto {
   duration?: number | null;
   created_at: string;
   cancel_requested: boolean;
+}
+
+/** 后端 ShotResponse（snake_case） */
+export interface ShotDto {
+  id: string;
+  shot_number: number;
+  label: string;
+  description: string;
+  duration: number;
+  video_url?: string | null;
 }
 
 export interface RenderStatusDto {
@@ -228,7 +239,13 @@ export interface AssetDto {
   type: "image" | "audio" | "video";
   mime_type: string;
   size: number;
+  /** 短期签名链接（只能用于展示/播放，几分钟后失效） */
   url: string;
+  /**
+   * 不带签名的稳定存储地址。绑定到镜头时必须存这个：
+   * 把 url 存进 shots.video_url，签名过期后渲染就取不到素材了。
+   */
+  canonical_url?: string | null;
   thumbnail_url?: string | null;
   tags: string[];
   duration?: number | null;
