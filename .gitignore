@@ -100,3 +100,9 @@ backend/uvicorn_*.log
 # ---- M2（2026-10-26）----
 # Celery kombu filesystem 传输在 cwd 生成的 control 目录（运行产物）
 backend/control/
+
+# ---- M3（2026-10-26）----
+# 测试/工具在 backend 下生成的临时目录（pytest tmpdir、upload_from_path 临时文件）
+backend/tmp*/
+backend/pytest-of-*/
+backend/probe_sqlite_*.db

@@ -1,0 +1,35 @@
+# 构建上下文必须瘦身：否则 backend/venv 与 frontend/node_modules 会被打进镜像
+.git
+.gitignore
+.github
+*.md
+!README.md
+.idea
+.vscode
+
+# Python
+**/venv
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+backend/data
+backend/control
+backend/*.log
+*.db
+*.db-wal
+*.db-shm
+
+# Node / Next
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/dev.log
+frontend/*.tsbuildinfo
+
+# 本地环境与交付物
+.env
+.env.*
+!.env.example
+*.docx
+quarantine

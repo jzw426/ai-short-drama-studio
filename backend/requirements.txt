@@ -9,6 +9,7 @@ pydantic-settings==2.1.0
 sqlalchemy[asyncio]==2.0.25
 aiosqlite==0.19.0
 asyncpg==0.29.0        # PostgreSQL (optional; default SQLite)
+psycopg2-binary==2.9.9 # Alembic 走同步引擎执行迁移（DATABASE_URL_SYNC 是 postgresql://）
 alembic==1.13.1
 
 # Redis + Celery (task queue)

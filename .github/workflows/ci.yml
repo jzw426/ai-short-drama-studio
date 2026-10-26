@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 配置层是 fail-closed 的：没有 SECRET_KEY 会直接拒启，CI 里显式给一个测试值
+  SECRET_KEY: ci-only-secret-key-0123456789abcdef0123456789abcdef
+  ENVIRONMENT: test
+
+jobs:
+  backend:
+    name: backend tests (sqlite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: install ffmpeg (渲染集成测试需要)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: install deps
+        run: pip install -r backend/requirements.txt
+      - name: pytest
+        working-directory: backend
+        env:
+          DATABASE_TYPE: sqlite
+          DATABASE_PATH: ${{ github.workspace }}/backend/data/ci.db
+        run: python -m pytest tests -q
+
+  migrations:
+    name: alembic roundtrip
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ai_drama_studio
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r backend/requirements.txt
+      - name: sqlite upgrade/downgrade
+        working-directory: backend
+        env:
+          DATABASE_TYPE: sqlite
+          DATABASE_PATH: ${{ github.workspace }}/backend/data/mig.db
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+      - name: postgres upgrade/downgrade
+        working-directory: backend
+        env:
+          DATABASE_TYPE: postgres
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "5432"
+          POSTGRES_DB: ai_drama_studio
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_password
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+
+  frontend:
+    name: frontend typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  docker:
+    name: docker images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.backend
+          push: false
+          tags: ai-drama-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.frontend
+          push: false
+          tags: ai-drama-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,24 @@
+# M3-1：真实全栈 E2E 覆盖层
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml -p aidrama-e2e up -d --build postgres redis minio backend celery-worker
+# 与主 compose 的差异只有：存储切 MinIO 私有桶、worker 少并发、后端少 worker、关掉重启策略。
+services:
+  backend:
+    environment:
+      - STORAGE_TYPE=minio
+      - MINIO_PUBLIC_ENDPOINT=localhost:9000
+      - MEDIA_URL_TTL_SECONDS=600
+      - LOG_FORMAT=json
+    # E2E 只要 1 个 worker：4 worker × pool 20 会把容器内存和 PG 连接打满
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"]
+    restart: "no"
+
+  celery-worker:
+    environment:
+      - STORAGE_TYPE=minio
+      - MINIO_PUBLIC_ENDPOINT=localhost:9000
+      - LOG_FORMAT=json
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=1
+    restart: "no"
+
+  minio:
+    restart: "no"
