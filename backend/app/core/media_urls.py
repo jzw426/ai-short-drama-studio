@@ -56,6 +56,27 @@ def verify_media_signature(
     return hmac.compare_digest(media_signature(object_name, exp_int), sig)
 
 
+async def signed_media_url(
+    url: Optional[str], ttl: Optional[int] = None
+) -> Optional[str]:
+    """把存储 URL 转成浏览器可直接用的受控链接（异步版本，路由层统一用它）。
+
+    - local：追加 `?exp=&sig=`（HMAC，纯本地计算，无 IO）；
+    - minio：换成**预签名 URL**（SigV4；桶已私有，裸 URL 现在会 403）；
+    - 外链（第三方图床等）：原样返回。
+
+    为什么必须异步：minio-py 是同步 SDK（预签名是纯本地 SigV4 计算，但调用方
+    仍要把它丢进 asyncio.to_thread，避免将来 SDK 行为变化时阻塞事件循环）。
+    """
+    if not url:
+        return None
+    if settings.STORAGE_TYPE == "local" or object_name_from_url(url):
+        return sign_media_url(url, ttl)
+    from app.services.storage_service import storage_service
+
+    return await storage_service.presigned_url_for(url, ttl)
+
+
 def sign_media_url(url: Optional[str], ttl: Optional[int] = None) -> Optional[str]:
     """把规范 URL 签名；外链（MinIO 预签名、第三方图床）原样返回。"""
     if not url:

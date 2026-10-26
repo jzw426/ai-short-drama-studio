@@ -11,7 +11,7 @@ from app.core.deps import get_current_user
 from app.models.asset import Asset
 from app.models.project import Project
 from app.models.user import User
-from app.core.media_urls import sign_media_url
+from app.core.media_urls import signed_media_url
 from app.schemas.asset import AssetResponse
 from app.services.storage_service import storage_service, extract_object_name
 
@@ -87,8 +87,9 @@ async def list_assets(
     result = await db.execute(stmt)
     responses = [AssetResponse.model_validate(a) for a in result.scalars().all()]
     for resp in responses:
-        resp.url = sign_media_url(resp.url) or resp.url
-        resp.thumbnail_url = sign_media_url(resp.thumbnail_url)
+        # M1：MinIO 私有桶下签名变成"生成预签名 URL"，是异步的
+        resp.url = await signed_media_url(resp.url) or resp.url
+        resp.thumbnail_url = await signed_media_url(resp.thumbnail_url)
     return responses
 
 
@@ -173,7 +174,7 @@ async def upload_asset(
     await db.refresh(asset)
 
     resp = AssetResponse.model_validate(asset)
-    resp.url = sign_media_url(resp.url) or resp.url
+    resp.url = await signed_media_url(resp.url) or resp.url
     return resp
 
 
@@ -214,4 +215,8 @@ async def get_asset_url(
         raise HTTPException(status_code=404, detail="素材存储对象缺失")
     presigned_url = await storage_service.get_presigned_url(object_name)
 
-    return {"url": sign_media_url(presigned_url) or presigned_url}
+    if settings.STORAGE_TYPE == "local":
+        # local 下 get_presigned_url 只是 /uploads/<name>，还需要补 HMAC 签名
+        return {"url": await signed_media_url(presigned_url) or presigned_url}
+    # MinIO 下已经是完整预签名 URL，不要再签一次
+    return {"url": presigned_url}

@@ -4,7 +4,7 @@ from typing import List
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.media_urls import sign_media_url
+from app.core.media_urls import signed_media_url
 from app.models.character import Character
 from app.models.project import Project
 from app.models.user import User
@@ -18,11 +18,17 @@ from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota
 router = APIRouter(tags=["Characters"])
 
 
-def _to_response(character: Character) -> CharacterResponse:
-    """ORM → 响应模型，媒体链接（头像/形象图）在此签名，数据库只存规范 URL"""
+async def _to_response(character: Character) -> CharacterResponse:
+    """ORM → 响应模型，媒体链接（头像/形象图）在此签名，数据库只存规范 URL。
+
+    M1：MinIO 模式下这里生成的是预签名 URL（桶已私有），所以必须 await。
+    """
     resp = CharacterResponse.model_validate(character)
-    resp.avatar_url = sign_media_url(resp.avatar_url)
-    resp.generated_images = [u for u in (sign_media_url(x) for x in (resp.generated_images or [])) if u]
+    resp.avatar_url = await signed_media_url(resp.avatar_url)
+    signed_images = [
+        await signed_media_url(x) for x in (resp.generated_images or [])
+    ]
+    resp.generated_images = [u for u in signed_images if u]
     return resp
 
 
@@ -57,7 +63,7 @@ async def list_characters(
         .where(Character.project_id == project_id)
         .order_by(Character.created_at.desc())
     )
-    return [_to_response(c) for c in result.scalars().all()]
+    return [await _to_response(c) for c in result.scalars().all()]
 
 
 @router.post("/projects/{project_id}/characters", response_model=CharacterResponse, status_code=201)
@@ -84,7 +90,7 @@ async def create_character(
     db.add(character)
     await db.flush()
     await db.refresh(character)
-    return _to_response(character)
+    return await _to_response(character)
 
 
 @router.put("/projects/{project_id}/characters/{character_id}", response_model=CharacterResponse)
@@ -115,7 +121,7 @@ async def update_character(
 
     await db.flush()
     await db.refresh(character)
-    return _to_response(character)
+    return await _to_response(character)
 
 
 @router.delete("/projects/{project_id}/characters/{character_id}", status_code=204)
@@ -189,7 +195,7 @@ async def ai_generate_character(
     db.add(character)
     await db.flush()
     await db.refresh(character)
-    return _to_response(character)
+    return await _to_response(character)
 
 
 @router.post("/projects/{project_id}/characters/{character_id}/generate-image", response_model=CharacterResponse)
@@ -236,4 +242,4 @@ async def generate_character_image(
 
     await db.flush()
     await db.refresh(character)
-    return _to_response(character)
+    return await _to_response(character)

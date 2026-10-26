@@ -32,6 +32,8 @@
 - **缓存/队列**：Redis + Celery（broker 不可达时任务快速失败，不阻塞接口）
 - **认证**：JWT（PyJWT, HS256, 7 天有效期）+ PBKDF2-SHA256 密码哈希；业务路由全部要求登录；登录同时下发 **httpOnly Cookie**（前端以 Cookie 为会话主通道，Token 不再存入 localStorage，XSS 不可窃取；`POST /auth/logout` 清除会话）
 - **存储**：本地文件（默认）/ MinIO（可选）；删除项目/素材时**物理同步清理文件与空目录**（不再残留孤儿文件）
+  - 媒体一律**受控访问**：本地模式下 `/uploads/*` 需要「有效 HMAC 签名」或「登录 + 项目归属」，MinIO 模式下桶为**私有**、链接一律预签名（TTL 见 `MEDIA_URL_TTL_SECONDS`）。数据库只存规范 URL，签名在响应阶段生成，所以链接会过期、旧链接泄露不等于永久泄露。
+  - 切 MinIO 时注意 `MINIO_PUBLIC_ENDPOINT`：SigV4 签名覆盖 Host 头，签名用的主机名必须是浏览器实际访问的主机名（容器内 `minio:9000` 浏览器解析不了），否则预签名链接 403。
 - **视频处理**：FFmpeg（拼接前统一转码 H.264/yuv420p/24fps，避免编码不一致花屏）
 
 ### AI 能力（Agnes AI 全免费一站式）

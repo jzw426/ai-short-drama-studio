@@ -7,7 +7,7 @@ from typing import List
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.media_urls import sign_media_url
+from app.core.media_urls import signed_media_url
 from app.models.asset import RenderTask
 from app.models.project import Project
 from app.models.user import User
@@ -19,10 +19,13 @@ router = APIRouter(tags=["Render"])
 _ACTIVE_STATUSES = ("queued", "processing", "completed")
 
 
-def _task_response(task: RenderTask) -> RenderTaskResponse:
-    """统一出口：库里存规范 URL，响应时才签名（M1 媒体受控）。"""
+async def _task_response(task: RenderTask) -> RenderTaskResponse:
+    """统一出口：库里存规范 URL，响应时才签名（M1 媒体受控）。
+
+    MinIO 私有桶模式下这里生成预签名 URL，所以必须是 async。
+    """
     resp = RenderTaskResponse.model_validate(task)
-    resp.output_url = sign_media_url(resp.output_url)
+    resp.output_url = await signed_media_url(resp.output_url)
     return resp
 
 
@@ -84,7 +87,7 @@ async def submit_render_task(
         ).scalars().first()
         if existing:
             response.status_code = 200
-            return _task_response(existing)
+            return await _task_response(existing)
 
     render_task = RenderTask(
         project_id=project_id,
@@ -115,7 +118,7 @@ async def submit_render_task(
 
     await db.flush()
     await db.refresh(render_task)
-    return _task_response(render_task)
+    return await _task_response(render_task)
 
 
 @router.get("/render/{task_id}/status", response_model=RenderStatusResponse)
@@ -131,7 +134,7 @@ async def get_render_status(
         task_id=str(task.id),
         status=task.status,
         progress=task.progress,
-        output_url=sign_media_url(task.output_url),
+        output_url=await signed_media_url(task.output_url),
         error_message=task.error_message,
     )
 
@@ -149,7 +152,7 @@ async def list_render_tasks(
         .where(RenderTask.project_id == project_id)
         .order_by(RenderTask.created_at.desc())
     )
-    return [_task_response(t) for t in result.scalars().all()]
+    return [await _task_response(t) for t in result.scalars().all()]
 
 
 @router.post("/render/{task_id}/cancel", response_model=RenderStatusResponse)
@@ -189,7 +192,7 @@ async def cancel_render_task(
         task_id=str(task.id),
         status=task.status,
         progress=task.progress,
-        output_url=sign_media_url(task.output_url),
+        output_url=await signed_media_url(task.output_url),
         error_message=task.error_message,
     )
 
@@ -209,4 +212,4 @@ async def get_download_url(
     if not task.output_url:
         raise HTTPException(status_code=404, detail="输出文件不存在")
 
-    return {"download_url": sign_media_url(task.output_url)}
+    return {"download_url": await signed_media_url(task.output_url)}

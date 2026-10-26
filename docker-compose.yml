@@ -42,10 +42,17 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      # 存储后端：local（默认，写 uploads 卷）或 minio（私有桶 + 预签名 URL）
+      - STORAGE_TYPE=${STORAGE_TYPE:-local}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
       - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-ai-drama-studio-assets}
+      - MINIO_REGION=${MINIO_REGION:-us-east-1}
+      # 浏览器访问 MinIO 的地址；容器内 minio:9000 浏览器解析不了，签名必须按对外地址签
+      - MINIO_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
+      - MINIO_PUBLIC_USE_SSL=${MINIO_PUBLIC_USE_SSL:-false}
+      - MEDIA_URL_TTL_SECONDS=${MEDIA_URL_TTL_SECONDS:-21600}
       - AGNES_API_KEY=${AGNES_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - HF_API_TOKEN=${HF_API_TOKEN}
@@ -97,10 +104,17 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
       - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      # 存储后端：local（默认，写 uploads 卷）或 minio（私有桶 + 预签名 URL）
+      - STORAGE_TYPE=${STORAGE_TYPE:-local}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
       - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-ai-drama-studio-assets}
+      - MINIO_REGION=${MINIO_REGION:-us-east-1}
+      # 浏览器访问 MinIO 的地址；容器内 minio:9000 浏览器解析不了，签名必须按对外地址签
+      - MINIO_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
+      - MINIO_PUBLIC_USE_SSL=${MINIO_PUBLIC_USE_SSL:-false}
+      - MEDIA_URL_TTL_SECONDS=${MEDIA_URL_TTL_SECONDS:-21600}
       - AGNES_API_KEY=${AGNES_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - HF_API_TOKEN=${HF_API_TOKEN}

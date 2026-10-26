@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_BUCKET_NAME: str = "ai-drama-studio-assets"
     MINIO_USE_SSL: bool = False
+    MINIO_REGION: str = "us-east-1"
+    # 浏览器可达的 endpoint（host[:port]）。M1 起桶是私有的，链接一律是预签名 URL，
+    # 而 SigV4 的签名覆盖 Host 头 —— 所以"签名用的主机名"必须就是浏览器访问的主机名。
+    # 留空则沿用 MINIO_ENDPOINT（要求它本身对浏览器可达）。容器里常写成 minio:9000，
+    # 那个名字浏览器解析不了，此时必须在这里填 localhost:9000 或对外域名。
+    MINIO_PUBLIC_ENDPOINT: str = ""
+    MINIO_PUBLIC_USE_SSL: bool = False
 
     # Celery
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
