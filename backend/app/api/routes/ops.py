@@ -191,7 +191,7 @@ def _finalize_bucket(bucket: dict) -> dict:
 async def usage_stats(
     days: int = Query(7, ge=1, le=_USAGE_DAYS_MAX, description="统计最近 N 天（含今天）"),
     operation: Optional[str] = Query(
-        None, description="按 operation 过滤：script/character/storyboard/video"
+        None, description="按 operation 过滤：script/character/storyboard/video/image"
     ),
     current_user=Depends(get_current_user),
     db=Depends(get_db),

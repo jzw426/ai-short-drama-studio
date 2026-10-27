@@ -160,6 +160,34 @@ export const characterApi = {
       undefined,
       { timeout: 330000 }
     ),
+  /**
+   * 锁定角色形象（M4-2）：把基准图落到自有存储，并记下 seed 与外观描述。
+   * 之后所有出图都走「参考图 + 同 seed」的图生图，同一个角色才不会每张脸都不一样。
+   * 该接口不调用 AI、不占配额。
+   */
+  lockFace: (
+    projectId: string,
+    charId: string,
+    data: { source_url?: string; seed?: number; visual_prompt?: string }
+  ) => api.post(`/projects/${projectId}/characters/${charId}/lock-face`, data),
+  /**
+   * 生成三视图（front/side/full/back）。每个视角各消耗一次 AI 配额，
+   * 服务端逐视角失败退配额、部分成功也返回已有结果。
+   */
+  generateViews: (
+    projectId: string,
+    charId: string,
+    views?: string[],
+    seed?: number
+  ) =>
+    api.post(
+      `/projects/${projectId}/characters/${charId}/views`,
+      {
+        ...(views && views.length ? { views } : {}),
+        ...(seed != null ? { seed } : {}),
+      },
+      { timeout: 600000 }
+    ),
 };
 
 // ===== 渲染 API =====
@@ -265,6 +293,14 @@ export interface CharacterDto {
   backstory: string;
   created_at?: string;
   updated_at?: string;
+  /** 锁定后的基准图（自有存储签名地址）；null 表示还没锁脸 */
+  reference_image_url?: string | null;
+  /** 锁脸时固定的图像种子，出图时透传，保证同角色同一张脸 */
+  image_seed?: number | null;
+  /** 锁脸时冻结的外观描述（只留外观锚点，不含剧情） */
+  visual_prompt?: string | null;
+  /** 三视图：front / side / full / back → 图片地址 */
+  view_images?: Record<string, string>;
 }
 
 /** 后端 ShotResponse（snake_case） */

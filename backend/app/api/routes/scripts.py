@@ -12,7 +12,7 @@ from app.schemas.script import (
     AIGenerateRequest, AIGenerateResponse,
 )
 from app.services.ai_service import AIUnavailableError, ai_service
-from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota
+from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota_and_commit
 
 router = APIRouter(tags=["Scripts"])
 
@@ -139,7 +139,7 @@ async def ai_generate_script(
             project_id=project_id,
         )
     except AIUnavailableError as e:
-        await refund_ai_quota(db, current_user.id)
+        await refund_ai_quota_and_commit(db, current_user.id)
         raise HTTPException(status_code=503, detail=f"AI 剧本生成失败：{e}") from e
 
     # 记录历史

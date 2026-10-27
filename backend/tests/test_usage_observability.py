@@ -287,7 +287,8 @@ async def test_ops_usage_aggregates_and_filters():
             assert filtered.json()["total"]["estimated_cost_usd"] == pytest.approx(0.05)
             assert filtered.json()["daily"][-3]["calls"] == 1
 
-            bad = await client.get("/api/v1/ops/usage?days=7&operation=image")
+            # M4-2 起 "image" 是合法 operation（AI 出图要记账），这里换成真正不存在的值
+            bad = await client.get("/api/v1/ops/usage?days=7&operation=unknown-op")
             assert bad.status_code == 400
             assert "operation" in bad.json()["detail"]
     finally:

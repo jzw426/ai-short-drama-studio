@@ -309,6 +309,49 @@ def _remote_extension(url: str, content_type: str) -> str:
     return ".bin"
 
 
+async def read_object_bytes(
+    url: str, *, max_bytes: int = 64 * 1024 * 1024
+) -> tuple[bytes, str]:
+    """读取自有存储里的对象字节，返回 (bytes, content_type)。
+
+    用途：把角色卡/参考图喂给支持图生图的 provider（M4-2 锁脸）。只接受自有
+    存储地址（/uploads/... 或 minio 规范 URL）—— 不接受任意公网 URL，否则这个
+    函数就成了服务端请求伪造（SSRF）的入口。
+    """
+    object_name = extract_object_name(url)
+    if not object_name:
+        raise ValueError(f"不是自有存储地址，拒绝读取: {(url or '')[:120]}")
+
+    import mimetypes
+
+    suffix = os.path.splitext(object_name)[1].lower()
+    content_type = mimetypes.guess_type(f"x{suffix}")[0] or "application/octet-stream"
+
+    if settings.STORAGE_TYPE == "local":
+        path = _secure_local_path(object_name)
+        size = os.path.getsize(path)
+        if size > max_bytes:
+            raise ValueError(f"对象过大（{size} bytes > {max_bytes}）: {object_name}")
+        with open(path, "rb") as fh:
+            return fh.read(), content_type
+
+    def _read_minio() -> bytes:
+        response = storage_service.client.get_object(
+            settings.MINIO_BUCKET_NAME, object_name
+        )
+        try:
+            data = response.read(max_bytes + 1)
+        finally:
+            response.close()
+            response.release_conn()
+        return data
+
+    data = await asyncio.to_thread(_read_minio)
+    if len(data) > max_bytes:
+        raise ValueError(f"对象过大（> {max_bytes}）: {object_name}")
+    return data, content_type
+
+
 async def persist_remote_media(
     url: str,
     object_prefix: str,

@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   AlertTriangle,
+  Fingerprint,
+  Images,
   Loader2,
   Plus,
   Search,
@@ -12,8 +14,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { CharacterCard, type Character } from "@/components/CharacterCard";
-import { characterApi } from "@/lib/api";
+import {
+  CharacterCard,
+  VIEW_LABELS,
+  type Character,
+} from "@/components/CharacterCard";
+import { characterApi, mediaUrl } from "@/lib/api";
 import { GENDER_OPTIONS, ROLE_OPTIONS, roleLabel } from "@/lib/labels";
 import { useCurrentProject } from "@/lib/useCurrentProject";
 
@@ -83,6 +89,18 @@ export default function CharactersPage() {
   const [aiDescription, setAiDescription] = useState("");
   const [aiGenerating, setAiGenerating] = useState(false);
   const [generatingId, setGeneratingId] = useState<string | null>(null);
+
+  // 一致性面板：锁脸 / seed / 三视图
+  const [consistencyId, setConsistencyId] = useState<string | null>(null);
+  const [seedInput, setSeedInput] = useState("");
+  const [promptInput, setPromptInput] = useState("");
+  const [locking, setLocking] = useState(false);
+  const [viewsGenerating, setViewsGenerating] = useState(false);
+  const [viewSelection, setViewSelection] = useState<string[]>([
+    "front",
+    "side",
+    "full",
+  ]);
 
   const loadCharacters = useCallback(async () => {
     if (!projectId) return;
@@ -230,6 +248,84 @@ export default function CharactersPage() {
     }
   };
 
+  const consistencyChar = consistencyId
+    ? characters.find((c) => c.id === consistencyId) ?? null
+    : null;
+
+  const openConsistency = (characterId: string) => {
+    const target = characters.find((c) => c.id === characterId);
+    setConsistencyId(characterId);
+    setSeedInput(target?.image_seed != null ? String(target.image_seed) : "");
+    setPromptInput(target?.visual_prompt ?? "");
+  };
+
+  const closeConsistency = () => {
+    if (locking || viewsGenerating) return;
+    setConsistencyId(null);
+  };
+
+  /** 锁脸：把基准图落到自有存储 + 固定 seed/外观描述。不调用 AI、不占配额。 */
+  const handleLockFace = async () => {
+    if (!projectId || !consistencyChar || locking) return;
+    const source = consistencyChar.avatar_url || consistencyChar.reference_image_url;
+    if (!source) {
+      toast.error("这个角色还没有任何参考图，先点「AI 生成形象」或上传头像");
+      return;
+    }
+    let seed: number | undefined;
+    if (seedInput.trim()) {
+      const parsed = Number(seedInput.trim());
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 4294967295) {
+        toast.error("seed 必须是 0 ~ 4294967295 的整数");
+        return;
+      }
+      seed = parsed;
+    }
+    setLocking(true);
+    try {
+      await characterApi.lockFace(projectId, consistencyChar.id, {
+        source_url: source,
+        ...(seed != null ? { seed } : {}),
+        ...(promptInput.trim() ? { visual_prompt: promptInput.trim() } : {}),
+      });
+      toast.success(seed != null ? `已锁定形象 · seed ${seed}` : "已锁定形象");
+      await loadCharacters();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "锁脸失败");
+    } finally {
+      setLocking(false);
+    }
+  };
+
+  /** 三视图：逐视角调 AI（每视角消耗一次配额，失败由服务端退配额）。 */
+  const handleGenerateViews = async () => {
+    if (!projectId || !consistencyChar || viewsGenerating) return;
+    if (!consistencyChar.reference_image_url) {
+      toast.error("请先锁定形象，否则三个视角会是三个不同的人");
+      return;
+    }
+    if (viewSelection.length === 0) {
+      toast.error("至少选择一个视角");
+      return;
+    }
+    setViewsGenerating(true);
+    try {
+      await characterApi.generateViews(projectId, consistencyChar.id, viewSelection);
+      toast.success("三视图已生成");
+      await loadCharacters();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "三视图生成失败");
+    } finally {
+      setViewsGenerating(false);
+    }
+  };
+
+  const toggleView = (key: string) => {
+    setViewSelection((prev) =>
+      prev.includes(key) ? prev.filter((v) => v !== key) : [...prev, key]
+    );
+  };
+
   if (!project) {
     return (
       <div className="max-w-3xl mx-auto mt-20 card p-10 text-center space-y-4">
@@ -359,9 +455,167 @@ export default function CharactersPage() {
               onEdit={() => openEdit(character)}
               onDelete={handleDelete}
               onGenerateImage={handleGenerateImage}
+              onConsistency={openConsistency}
               generating={generatingId === character.id}
             />
           ))}
+        </div>
+      )}
+
+      {/* 一致性面板：锁脸 / seed / 三视图 */}
+      {consistencyChar && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={closeConsistency}
+        >
+          <div
+            className="card w-full max-w-2xl max-h-[90vh] overflow-y-auto p-5 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Fingerprint size={18} className="text-primary-600" />
+                <h2 className="font-semibold text-surface-800">
+                  角色一致性 · {consistencyChar.name}
+                </h2>
+              </div>
+              <button
+                onClick={closeConsistency}
+                className="p-1.5 rounded-md hover:bg-surface-100 text-surface-400"
+                title="关闭"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <p className="text-xs text-surface-500 leading-relaxed">
+              锁脸会把当前形象保存为基准图，并固定 <code>seed</code> 与外观描述；
+              之后每次出图都走「参考图 + 同 seed」的图生图，角色才不会一集换一张脸。
+              锁脸本身不调用 AI、不消耗配额；三视图每生成一个视角消耗一次 AI 配额。
+            </p>
+
+            <div className="flex gap-4">
+              <div className="w-28 h-28 flex-shrink-0 rounded-lg overflow-hidden bg-surface-100 flex items-center justify-center">
+                {consistencyChar.reference_image_url || consistencyChar.avatar_url ? (
+                  <img
+                    src={mediaUrl(
+                      consistencyChar.reference_image_url || consistencyChar.avatar_url
+                    )}
+                    alt={consistencyChar.name}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <Sparkles size={26} className="text-surface-300" />
+                )}
+              </div>
+              <div className="flex-1 space-y-2">
+                <label className="space-y-1 block">
+                  <span className="text-xs text-surface-500">
+                    seed（留空则自动随机一次，之后固定不变）
+                  </span>
+                  <input
+                    value={seedInput}
+                    onChange={(e) => setSeedInput(e.target.value)}
+                    inputMode="numeric"
+                    placeholder={
+                      consistencyChar.image_seed != null
+                        ? String(consistencyChar.image_seed)
+                        : "例如 123456"
+                    }
+                    className="input-field w-full"
+                  />
+                </label>
+                <label className="space-y-1 block">
+                  <span className="text-xs text-surface-500">
+                    外观描述（只写长相/发型/服装，不要写剧情）
+                  </span>
+                  <textarea
+                    value={promptInput}
+                    onChange={(e) => setPromptInput(e.target.value)}
+                    rows={3}
+                    maxLength={2000}
+                    placeholder="例如：黑长直，红风衣，丹凤眼，二十五六岁"
+                    className="input-field w-full resize-y"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2">
+              <button
+                onClick={() => void handleLockFace()}
+                disabled={locking}
+                className="btn-primary flex items-center gap-2 text-sm disabled:opacity-60"
+              >
+                {locking ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Fingerprint size={14} />
+                )}
+                {consistencyChar.reference_image_url ? "重新锁定" : "锁定形象"}
+              </button>
+            </div>
+
+            <div className="pt-3 border-t border-surface-100 space-y-3">
+              <div className="flex items-center gap-2">
+                <Images size={16} className="text-primary-600" />
+                <h3 className="font-medium text-surface-800 text-sm">三视图</h3>
+                <span className="text-xs text-surface-400">
+                  每视角一次 AI 调用（消耗配额）
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {VIEW_LABELS.map((v) => {
+                  const active = viewSelection.includes(v.key);
+                  return (
+                    <button
+                      key={v.key}
+                      onClick={() => toggleView(v.key)}
+                      className={`text-xs px-2.5 py-1 rounded-full border ${
+                        active
+                          ? "border-primary-300 bg-primary-50 text-primary-700"
+                          : "border-surface-200 text-surface-500"
+                      }`}
+                    >
+                      {v.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="grid grid-cols-4 gap-2">
+                {VIEW_LABELS.map((v) => (
+                  <div key={v.key} className="space-y-1">
+                    <div className="aspect-[3/4] rounded-md overflow-hidden bg-surface-100 flex items-center justify-center">
+                      {consistencyChar.view_images?.[v.key] ? (
+                        <img
+                          src={mediaUrl(consistencyChar.view_images[v.key])}
+                          alt={`${consistencyChar.name} ${v.label}`}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <span className="text-[10px] text-surface-400">未生成</span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-center text-surface-500">{v.label}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center justify-end">
+                <button
+                  onClick={() => void handleGenerateViews()}
+                  disabled={viewsGenerating}
+                  className="btn-outline flex items-center gap-2 text-sm disabled:opacity-60"
+                >
+                  {viewsGenerating ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <Images size={14} />
+                  )}
+                  {viewsGenerating ? "生成中…" : "生成所选视角"}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

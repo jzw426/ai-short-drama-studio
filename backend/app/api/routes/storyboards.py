@@ -5,7 +5,7 @@ from typing import List
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.storyboard import Storyboard, Shot
-from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota
+from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota_and_commit
 from app.services.ai_service import AIUnavailableError, ai_service
 from app.models.project import Project
 from app.models.user import User
@@ -250,7 +250,7 @@ async def generate_storyboard_from_script(
             reserved += 1
     except HTTPException:
         for _ in range(reserved):
-            await refund_ai_quota(db, current_user.id)
+            await refund_ai_quota_and_commit(db, current_user.id)
         raise
 
     # 逐场景生成（只写内存，不落库）；任一场景失败则整体回退
@@ -271,7 +271,7 @@ async def generate_storyboard_from_script(
                 planned.append((scene, s))
     except AIUnavailableError as e:
         for _ in range(reserved):
-            await refund_ai_quota(db, current_user.id)
+            await refund_ai_quota_and_commit(db, current_user.id)
         raise HTTPException(status_code=503, detail=f"AI 分镜生成失败：{e}") from e
 
     # 全部成功后才替换旧镜头

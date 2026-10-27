@@ -14,7 +14,10 @@
     不再依赖"先读后写"。
   * **不在请求中途 commit**：事务边界交给 `get_db`（请求结束统一提交/回滚），
     否则一次请求里多次 commit 会让"扣了配额但业务失败"无法回滚。
+  * **唯一例外：失败路径退款**用 `refund_ai_quota_and_commit`。因为 `get_db` 在抛异常时
+    rollback，退款若留在同一事务里会被一起回滚 —— 用户失败照样被扣次数（M4-2 实测抓到）。
 """
+import logging
 from datetime import timedelta, timezone
 
 from fastapi import HTTPException
@@ -25,6 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.time_utils import utc_now
 from app.models.ai_usage import AIUsage
+
+logger = logging.getLogger(__name__)
 
 
 class QuotaExceeded(Exception):
@@ -116,6 +121,24 @@ async def refund_ai_quota(db: AsyncSession, user_id: str) -> None:
         .values(count=AIUsage.count - 1, updated_at=utc_now())
         .execution_options(synchronize_session=False)
     )
+
+
+async def refund_ai_quota_and_commit(db: AsyncSession, user_id: str) -> None:
+    """失败路径专用：退款并立即提交，避免被失败请求的回滚一起带走。
+
+    为什么必须单独提交：`get_db`（app/core/database.py:42）只在正常返回时 commit，
+    抛 HTTPException 时 rollback。退款如果只写进同一个事务，紧接着的
+    `raise HTTPException(503)` 会把退款一并回滚 —— 用户为失败买单（真实 bug，
+    tests/test_character_lockface.py::test_provider_without_edits_returns_501_and_refunds_quota 抓到）。
+    此刻业务写入本就要丢弃，只有退款需要活下来，所以这里刻意破例提交。
+    提交失败只记 warning：不能用一个次要错误掩盖原始失败原因。
+    """
+    await refund_ai_quota(db, user_id)
+    try:
+        await db.commit()
+    except Exception as exc:  # pragma: no cover - 提交失败极罕见
+        logger.warning("退配额提交失败（user=%s）：%s", user_id, exc)
+        await db.rollback()
 
 
 def _retry_after_seconds() -> int:

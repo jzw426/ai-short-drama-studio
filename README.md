@@ -127,6 +127,13 @@ venv\Scripts\python scripts\verify_p3_features.py  # P3 回归（多模型路由
 - **前端联动**：首页展示真实项目列表、新建项目入口；分镜页「从剧本生成分镜」、剧本页「导出 Markdown」按钮；API 客户端已暴露全部新接口
 - **分镜编辑器（完整可用）**：`StoryboardCanvas` 三栏式编辑器（工具栏 / 画布 / 属性面板 + 图层列表），fabric@5 客户端动态加载（webpack CJS interop 自动解包 `m.fabric ?? m.default.fabric`，规避服务端构建期 node-canvas/jsdom 依赖）；支持添加文字/场景框/圆形/箭头/上传图片、缩放平移（空格+拖拽）、双击编辑、属性实时编辑、图层排序、撤销/重做（操作前同步 `storyboardCanvasState` 保证 redo 栈可用）、保存画布 / 导出 PNG；画布状态自动持久化（防抖 800ms 自动 PUT 至后端 `canvas_state`，进入页面自动恢复；添加/删除/拖拽/属性编辑/撤销重做均触发保存，控制条显示 保存中/已自动保存/保存失败）
 
+## M4 内容生产闭环
+
+- **AI 产物转存**：provider 返回的都是带 TTL 的外链，旧代码原样入库，隔天形象库 403、断点续渲 404。现在所有 AI 图/视频结果先经 `storage_service.persist_remote_media()` 落到自有存储（`ai/images/{project}` / `ai/videos/{project}`），失败才回退原链接并告警
+- **角色一致性（锁脸）**：`POST /projects/{id}/characters/{cid}/lock-face` 把基准图转存并固定 `image_seed` + 冻结外观描述（`visual_prompt`）；之后出图走 provider 的 `/images/edits`（参考图 + 同 seed），同一个角色不再每张脸都不一样。provider 不支持参考图时返回 501，**不静默降级成文生图**
+- **三视图**：`POST /projects/{id}/characters/{cid}/views` 生成 front/side/full/back 任意子集，逐视角占配额、单张失败退该张配额；未锁脸直接 400（没基准图的三视图没有意义）
+- **失败不扣配额**：AI 调用失败会 `refund_ai_quota_and_commit()` 单独提交退款——因为 `get_db` 在异常时回滚整个会话，退款若留在同一事务里会被一起回滚（M4-2 修掉的真 bug）
+
 ## 项目结构
 
 ```

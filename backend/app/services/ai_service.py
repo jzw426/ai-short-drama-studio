@@ -25,7 +25,7 @@ from app.models.ai_usage import AIUsageEvent
 logger = logging.getLogger(__name__)
 
 # ai_usage_events.operation 的合法取值
-AI_OPERATIONS = ("script", "character", "storyboard", "video")
+AI_OPERATIONS = ("script", "character", "storyboard", "video", "image")
 
 # ai_usage_events.status 的合法取值
 AI_STATUS_SUCCESS = "success"
@@ -44,6 +44,14 @@ class AIUnavailableError(RuntimeError):
 
     调用方必须转成 5xx 明确告知用户；**禁止**用 mock/占位内容假装成功，
     否则用户为假结果付费、前端无法区分真假、排障时无法定位。
+    """
+
+
+class ImageCapabilityError(AIUnavailableError):
+    """当前配置的图片 provider 没有一个支持参考图（图生图 / edits）。
+
+    M4-2：锁脸必须真的把参考图传给 provider。宁可 501 明确失败，也不能悄悄退化成
+    "重新抽一张脸"——那等于角色每镜换人，而用户以为一致性已经生效了。
     """
 
 
@@ -595,15 +603,44 @@ class AIService:
 
     # ==================== 图片生成（多 provider 路由） ====================
 
+    async def _load_reference_image(self, url: str) -> tuple:
+        """取参考图字节：只接受自有存储地址，避免这个函数变成 SSRF 入口。"""
+        from app.services.storage_service import read_object_bytes
+
+        try:
+            return await read_object_bytes(url)
+        except Exception as exc:
+            raise AIUnavailableError(f"参考图读取失败（{url[:120]}）: {exc}") from exc
+
+    @staticmethod
+    def _image_urls_from_response(data) -> List[str]:
+        images = (data or {}).get("data", []) if isinstance(data, dict) else []
+        return [img.get("url", "") for img in images if img.get("url")]
+
     async def _image_generations(
-        self, prompt: str, size: str = "1024x1024"
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        *,
+        reference_image_url: Optional[str] = None,
+        seed: Optional[int] = None,
+        trace: Optional[dict] = None,
     ) -> List[str]:
-        """
-        按 provider 链顺序生成图片，返回图片 URL 列表。
-        当前实现：agnes（OpenAI 兼容 /images/generations）；
-        其他 provider 若配置但未实现，跳过并提示。
+        """按 provider 链顺序生成图片，返回图片 URL 列表。
+
+        - 纯文生图：走 OpenAI 兼容 /images/generations；
+        - 锁脸（传了 reference_image_url）：走 /images/edits 多部件上传参考图。
+          **没有任何 provider 支持 edits 时抛 ImageCapabilityError，不降级成文生图**。
+        - seed 只是确定性加成：provider 不认 seed（400）时重试一次不带 seed，并留 warning；
+          真正决定"是不是同一张脸"的是参考图，不是 seed。
         """
         client = await self._get_client()
+        ref_bytes: Optional[bytes] = None
+        ref_mime = "image/png"
+        if reference_image_url:
+            ref_bytes, ref_mime = await self._load_reference_image(reference_image_url)
+
+        capability_errors: List[str] = []
 
         for provider in settings.AI_IMAGE_PROVIDERS:
             name = provider.get("name", "unknown")
@@ -617,39 +654,143 @@ class AIService:
                 continue
             if self._is_cooling("image", name):
                 continue
+
+            if trace is not None:
+                trace["provider"] = name
+                trace["model"] = model
+
             try:
-                response = await client.post(
-                    f"{base}/images/generations",
-                    headers=self._auth_headers(api_key),
-                    json={
-                        "model": model,
-                        "prompt": prompt,
-                        "n": 1,
-                        "size": size,
-                        "response_format": "url",
-                    },
-                    timeout=httpx.Timeout(180.0),
-                )
-                response.raise_for_status()
-                data = response.json()
-                images = data.get("data", [])
-                urls = [img.get("url", "") for img in images if img.get("url")]
+                if ref_bytes is not None:
+                    urls = await self._image_edits_once(
+                        client, name, api_key, base, model, prompt, size,
+                        ref_bytes, ref_mime, seed,
+                        capability_errors,
+                    )
+                else:
+                    urls = await self._image_generation_once(
+                        client, name, api_key, base, model, prompt, size, seed
+                    )
                 if urls:
                     self._report_success("image", name)
                     logger.info("[AI Router] image provider '%s' 成功 (model=%s)", name, model)
                     return urls
                 logger.warning("[AI Router] image provider '%s' 返回空 URL 列表", name)
                 self._report_failure("image", name)
+            except ImageCapabilityError:
+                raise
             except Exception as e:
                 self._report_failure("image", name)
                 logger.warning("[AI Router] image provider '%s' 失败: %s，切换下一个", name, e)
 
+        if capability_errors and ref_bytes is not None:
+            raise ImageCapabilityError(
+                "没有可用的图片 provider 支持参考图（/images/edits）："
+                + "；".join(capability_errors)
+                + "。锁脸需要图生图能力，请配置支持的 provider，或在角色上关闭锁脸。"
+            )
         return []
 
-    async def generate_image(self, prompt: str, style: str = "anime-portrait") -> List[str]:
-        """使用图片 provider 链生成图片，返回图片 URL 列表"""
-        # style 参数保留用于未来风格化扩展
-        return await self._image_generations(prompt)
+    async def _image_generation_once(
+        self, client, name: str, api_key: str, base: str, model: str,
+        prompt: str, size: str, seed: Optional[int],
+    ) -> List[str]:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "n": 1,
+            "size": size,
+            "response_format": "url",
+        }
+        if seed is not None:
+            payload["seed"] = int(seed)
+
+        async def _post(body: dict):
+            return await client.post(
+                f"{base}/images/generations",
+                headers=self._auth_headers(api_key),
+                json=body,
+                timeout=httpx.Timeout(180.0),
+            )
+
+        response = await _post(payload)
+        if response.status_code == 400 and seed is not None:
+            # 有的 provider 不认 seed：去掉重试一次，别为了确定性把出图搞死
+            logger.warning("[AI Router] provider '%s' 不接受 seed，已去掉 seed 重试", name)
+            payload.pop("seed", None)
+            response = await _post(payload)
+        response.raise_for_status()
+        return self._image_urls_from_response(response.json())
+
+    async def _image_edits_once(
+        self, client, name: str, api_key: str, base: str, model: str,
+        prompt: str, size: str, ref_bytes: bytes, ref_mime: str,
+        seed: Optional[int], capability_errors: List[str],
+    ) -> List[str]:
+        ext = ".png" if "png" in ref_mime else ".jpg"
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "n": "1",
+            "size": size,
+            "response_format": "url",
+        }
+        if seed is not None:
+            data["seed"] = str(seed)
+
+        async def _post(form: dict):
+            return await client.post(
+                f"{base}/images/edits",
+                headers={"Authorization": f"Bearer {api_key}"},  # 不要手写 Content-Type
+                data=form,
+                files={"image": (f"reference{ext}", ref_bytes, ref_mime)},
+                timeout=httpx.Timeout(180.0),
+            )
+
+        response = await _post(data)
+        if response.status_code == 400 and seed is not None:
+            logger.warning("[AI Router] provider '%s' 不接受 seed，已去掉 seed 重试", name)
+            data.pop("seed", None)
+            response = await _post(data)
+
+        if response.status_code in (400, 404, 405, 415, 422, 501):
+            # 这些状态码在 edits 上通常意味着"这个 provider 没有图生图"
+            capability_errors.append(f"{name}: HTTP {response.status_code}")
+            logger.warning(
+                "[AI Router] provider '%s' 不支持参考图（edits HTTP %s），切换下一个",
+                name, response.status_code,
+            )
+            return []
+        response.raise_for_status()
+        return self._image_urls_from_response(response.json())
+
+    async def generate_image(
+        self,
+        prompt: str,
+        style: str = "anime-portrait",
+        *,
+        reference_image_url: Optional[str] = None,
+        seed: Optional[int] = None,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> List[str]:
+        """生成图片，返回图片 URL 列表（已记账，operation=image）。
+
+        reference_image_url 非空时启用锁脸（图生图）；provider 不支持则 501，
+        绝不静默退化成"重新抽一张脸"。
+        """
+        trace: dict = {}
+
+        async def _call() -> List[str]:
+            return await self._image_generations(
+                prompt,
+                reference_image_url=reference_image_url,
+                seed=seed,
+                trace=trace,
+            )
+
+        return await self._traced_call(
+            "image", trace, _call, user_id=user_id, project_id=project_id
+        )
 
     # ==================== 视频生成（多 provider 路由，异步轮询） ====================
 
