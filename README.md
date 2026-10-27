@@ -133,6 +133,9 @@ venv\Scripts\python scripts\verify_p3_features.py  # P3 回归（多模型路由
 - **角色一致性（锁脸）**：`POST /projects/{id}/characters/{cid}/lock-face` 把基准图转存并固定 `image_seed` + 冻结外观描述（`visual_prompt`）；之后出图走 provider 的 `/images/edits`（参考图 + 同 seed），同一个角色不再每张脸都不一样。provider 不支持参考图时返回 501，**不静默降级成文生图**
 - **三视图**：`POST /projects/{id}/characters/{cid}/views` 生成 front/side/full/back 任意子集，逐视角占配额、单张失败退该张配额；未锁脸直接 400（没基准图的三视图没有意义）
 - **失败不扣配额**：AI 调用失败会 `refund_ai_quota_and_commit()` 单独提交退款——因为 `get_db` 在异常时回滚整个会话，退款若留在同一事务里会被一起回滚（M4-2 修掉的真 bug）
+- **首帧图 → 图生视频（异步作业）**：`POST /projects/{id}/storyboard/shots/{sid}/first-frame` 出首帧（有就复用、不扣配额），`POST .../video-jobs` 提交**异步**视频作业（表 `ai_video_jobs`，`pending→submitted→polling→completed`，按 `next_poll_at` 自适应续排，可单独取消/重试某一镜）。provider 拒绝 `image` 入参时抛 `VideoCapabilityError`（502），**绝不静默退化成文生视频**
+- **渲染只消费产物**：`render_service._pick_source` 只取 `completed` 作业的最新产物或镜头显式绑定的素材，一次渲染里**不再有任何付费生成调用**；未绑定时报「镜头 N 未绑定素材：请先在分镜页生成视频或绑定素材」，并且 provider 一次都不会被调用（有 E2E 断言）
+- **场景四视图**：`scene_assets`（wide/medium/close/establishing，同场景同视角唯一、POST 即 upsert），`wide` 视角进首帧 prompt 作参考，压住「同一咖啡馆第一镜暖光、第三镜冷白」这种场景崩塌
 
 ## 项目结构
 
