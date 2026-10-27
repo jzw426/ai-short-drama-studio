@@ -183,7 +183,7 @@ async def test_render_segments_reuses_checkpoint_without_ai(service, monkeypatch
     shots = [{"shot_number": 1, "duration": 3.0, "description": "d", "label": "l"}]
     spec, _ = build_spec({})
     segments = await service._render_segments(
-        shots, str(tmp_path), spec, None, None, {1: "https://cdn/x.mp4"}
+        shots, str(tmp_path), spec, None, None, {1: "https://cdn/x.mp4"}, "p1"
     )
     assert segments[0]["status"] == "success"
     assert segments[0]["video_url"] == "https://cdn/x.mp4"
@@ -201,11 +201,52 @@ async def test_render_segments_explains_unbound_shot(service, monkeypatch, tmp_p
     spec, _ = build_spec({})
     shots = [{"shot_number": 2, "duration": 3.0, "description": "d", "label": "l"}]
     segments = await service._render_segments(
-        shots, str(tmp_path), spec, None, None, {}
+        shots, str(tmp_path), spec, None, None, {}, "p1"
     )
     assert segments[0]["status"] == "failed"
     assert "镜头 2" in segments[0]["error"]
     assert "未绑定素材" in segments[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_ai_video_is_persisted_before_entering_checkpoint(
+    service, monkeypatch, tmp_path
+):
+    """M4-1 回归：AI 视频必须先转存到自有存储，再作为片段地址返回。
+
+    旧实现把 provider 的 CDN 链接原样写进 checkpoint，链接 TTL 到点后
+    断点续渲必然 404 —— 恰好发生在最贵的那条路径上。
+    """
+    seen = {}
+
+    async def fake_generate(**kwargs):
+        return "https://provider-cdn.example/tmp/abc.mp4"
+
+    async def fake_persist(url, prefix, **kwargs):
+        seen["url"] = url
+        seen["prefix"] = prefix
+        return "/uploads/ai/videos/p9/persisted.mp4"
+
+    async def fake_stage(url, temp_dir, idx, source_kind):
+        path = os.path.join(temp_dir, f"segment_{idx:03d}.mp4")
+        with open(path, "wb") as fh:
+            fh.write(b"fake")
+        return path
+
+    monkeypatch.setattr(RENDER_MODULE.ai_service, "generate_video", fake_generate)
+    monkeypatch.setattr(RENDER_MODULE, "persist_remote_media", fake_persist)
+    monkeypatch.setattr(service, "_stage_segment", fake_stage)
+
+    spec, _ = build_spec({})
+    shots = [{"shot_number": 1, "duration": 3.0, "description": "d", "label": "l"}]
+    segments = await service._render_segments(
+        shots, str(tmp_path), spec, None, None, {}, "p9"
+    )
+
+    assert seen["url"] == "https://provider-cdn.example/tmp/abc.mp4"
+    assert seen["prefix"].startswith("ai/videos/p9/")
+    assert segments[0]["video_url"] == "/uploads/ai/videos/p9/persisted.mp4"
+    assert segments[0]["source"] == "local"
 
 
 def test_source_kind_rejects_escape_and_foreign_schemes(service):

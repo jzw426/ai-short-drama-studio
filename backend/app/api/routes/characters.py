@@ -1,3 +1,6 @@
+import logging
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
@@ -13,9 +16,11 @@ from app.schemas.character import (
     AIGenerateCharacterRequest,
 )
 from app.services.ai_service import AIUnavailableError, ai_service
+from app.services.storage_service import persist_remote_media
 from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota
 
 router = APIRouter(tags=["Characters"])
+logger = logging.getLogger(__name__)
 
 
 async def _to_response(character: Character) -> CharacterResponse:
@@ -30,6 +35,26 @@ async def _to_response(character: Character) -> CharacterResponse:
     ]
     resp.generated_images = [u for u in signed_images if u]
     return resp
+
+
+async def _persist_images(image_urls: List[str], project_id: str) -> List[str]:
+    """把 AI 出图的第三方链接转存到我们自己的存储（M4-1）。
+
+    provider 的链接带 TTL，写进库第二天就 403；转存失败时不阻塞业务，
+    回退成原链接并留 warning —— 素材没了总比角色设定一起丢掉好。
+    """
+    if not image_urls:
+        return []
+    persisted: List[str] = []
+    for url in image_urls:
+        try:
+            persisted.append(
+                await persist_remote_media(url, f"ai/images/{project_id}/{uuid.uuid4()}")
+            )
+        except Exception as exc:  # noqa: BLE001 - 单张失败不能拖垮整次生成
+            logger.warning("AI 图片转存失败，回退第三方链接: %s (%s)", url[:120], exc)
+            persisted.append(url)
+    return persisted
 
 
 async def _get_project_or_404(
@@ -182,6 +207,7 @@ async def ai_generate_character(
         prompt=f"Character portrait: {char_info.get('name', '')} - {char_info.get('description', request.description)}",
         style="anime-portrait",
     )
+    image_urls = await _persist_images(image_urls, project_id)
 
     character = Character(
         project_id=project_id,
@@ -230,6 +256,7 @@ async def generate_character_image(
     )
     await acquire_ai_quota_or_429(db, current_user.id)
     image_urls = await ai_service.generate_image(prompt=prompt, style="anime-portrait")
+    image_urls = await _persist_images(image_urls, project_id)
     if not image_urls:
         await refund_ai_quota(db, current_user.id)
         raise HTTPException(

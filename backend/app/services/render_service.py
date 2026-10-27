@@ -26,12 +26,13 @@ import re
 import shutil
 import tempfile
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 
 from app.core.config import settings
 from app.services.ai_service import AIUnavailableError, ai_service
-from app.services.storage_service import storage_service
+from app.services.storage_service import persist_remote_media, storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -481,7 +482,13 @@ class RenderService:
         temp_dir = tempfile.mkdtemp(prefix="render_")
         try:
             segments = await self._render_segments(
-                shots, temp_dir, spec, progress_callback, cancel_check, resume_urls
+                shots,
+                temp_dir,
+                spec,
+                progress_callback,
+                cancel_check,
+                resume_urls,
+                project_id,
             )
             results["segments"] = segments
             results["errors"].extend(
@@ -677,6 +684,7 @@ class RenderService:
         progress_callback: Optional[ProgressCallback],
         cancel_check: Optional[CancelCheck],
         resume_urls: dict,
+        project_id: str,
     ) -> List[dict]:
         total = len(shots)
         semaphore = asyncio.Semaphore(int(settings.RENDER_CONCURRENCY or 3))
@@ -694,7 +702,7 @@ class RenderService:
                     )
                 try:
                     video_url, source_kind = await self._pick_source(
-                        shot, resume_urls, spec
+                        shot, resume_urls, spec, project_id
                     )
                     await self._check_cancel(cancel_check)
                     segment_path = await self._stage_segment(
@@ -756,9 +764,14 @@ class RenderService:
         return segments
 
     async def _pick_source(
-        self, shot: dict, resume_urls: dict, spec: RenderSpec
+        self, shot: dict, resume_urls: dict, spec: RenderSpec, project_id: str
     ) -> Tuple[str, str]:
-        """按优先级决定镜头素材：显式绑定 > 断点 > AI 生成。"""
+        """按优先级决定镜头素材：显式绑定 > 断点 > AI 生成。
+
+        M4-1：AI 生成的视频必须立刻转存到我们自己的存储再进断点。provider 的
+        CDN 链接有 TTL（常见 1 小时），旧实现把它直接写进 checkpoint —— 断点续渲
+        复用 24 小时前的片段时必然 404，等于"断点续渲"在最贵的路径上失效。
+        """
         explicit = (shot.get("video_url") or "").strip()
         if explicit:
             kind = self._source_kind(explicit)
@@ -788,6 +801,17 @@ class RenderService:
         if not generated:
             raise RenderStepError(
                 f"镜头 {shot.get('shot_number')}", "AI 视频生成返回空地址"
+            )
+        try:
+            generated = await persist_remote_media(
+                str(generated), f"ai/videos/{project_id}/{uuid.uuid4()}"
+            )
+        except Exception as exc:  # noqa: BLE001 - 转存失败仍可用本次渲染，但要留痕
+            logger.warning(
+                "[Render] 镜头 %s AI 视频转存失败，回退第三方链接（断点续渲将失效）: %s (%s)",
+                shot.get("shot_number"),
+                str(generated)[:120],
+                exc,
             )
         kind = self._source_kind(str(generated))
         if not kind:

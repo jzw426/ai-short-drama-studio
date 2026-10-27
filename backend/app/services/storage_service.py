@@ -272,3 +272,96 @@ def extract_object_name(url: str) -> str:
     if marker in clean:
         return clean.split(marker, 1)[-1]
     return ""
+
+
+# ==================== AI 产物转存（M4-1） ====================
+
+_CONTENT_TYPE_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+}
+
+
+def _remote_extension(url: str, content_type: str) -> str:
+    """先看响应 Content-Type，再退回 URL 后缀，都不认识就 .bin。
+
+    AI provider 给的链接经常是 /files/abc123 这种无后缀路径，只看 URL 会判错。
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in _CONTENT_TYPE_EXT:
+        return _CONTENT_TYPE_EXT[ct]
+    path = url.split("?", 1)[0].split("#", 1)[0]
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in set(_CONTENT_TYPE_EXT.values()):
+        return suffix
+    return ".bin"
+
+
+async def persist_remote_media(
+    url: str,
+    object_prefix: str,
+    *,
+    timeout: float = 180.0,
+    max_bytes: int = 512 * 1024 * 1024,
+) -> str:
+    """把第三方地址（AI 出图 / 出视频结果）下载并转存到本项目存储，返回规范 URL。
+
+    为什么必须转存：provider 返回的是它自己 CDN 上的临时链接（常见 TTL 1 小时～
+    24 小时），也可能带防盗链。直接写进数据库等于把素材寿命交给了对方 ——
+    第二天用户打开形象库、或者断点续渲复用一个 24 小时前的 AI 片段，全是 403。
+    转存之后库里只存我们自己的规范 URL（local: /uploads/...；minio: .../{bucket}/...），
+    读的时候照常走 signed_media_url 签名。
+
+    已经是我们自己的地址时原样返回（幂等，重复调用不会重复下载）。
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("persist_remote_media 需要非空 URL")
+    if extract_object_name(url):
+        return url
+    if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+        raise ValueError(f"只能转存 http(s) 地址: {url[:120]}")
+
+    import httpx
+
+    chunks: list[bytes] = []
+    total = 0
+    content_type = ""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            declared = resp.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError(
+                    f"远端文件过大（{int(declared)} bytes > 上限 {max_bytes}）: {url[:120]}"
+                )
+            async for chunk in resp.aiter_bytes(1024 * 256):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"远端文件超过上限 {max_bytes} bytes，已中止: {url[:120]}"
+                    )
+                chunks.append(chunk)
+
+    if total == 0:
+        raise ValueError(f"远端返回空内容: {url[:120]}")
+
+    object_name = f"{object_prefix.rstrip('/')}{_remote_extension(url, content_type)}"
+    data = b"".join(chunks)
+    return await storage_service.upload_file(
+        object_name, data, content_type=content_type, size=total
+    )
+
