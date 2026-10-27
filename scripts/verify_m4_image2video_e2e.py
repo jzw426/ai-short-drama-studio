@@ -7,8 +7,14 @@ r"""M4-3 验收脚本：首帧图 → 图生视频（异步作业）→ 转存 �
 
 用法（仓库根目录）：
     backend\venv\Scripts\python.exe scripts\verify_m4_image2video_e2e.py
+    backend\venv\Scripts\python.exe scripts\verify_m4_image2video_e2e.py --live --yes-spend
 
-退出码 0 = 全链路通过。
+两种模式：
+    默认（fake）  进程内假 provider，验证管道契约，零花费，可反复跑。
+    --live       打真实 provider（读 .env 的 AGNES_* 配置），**真花钱**，
+                 必须显式 --yes-spend。没有 key 时直接退出 2，绝不退回 mock。
+
+退出码 0 = 全链路通过，2 = 无 key（未取证），3 = 真实 provider 契约不符。
 产物写在 backend/data/e2e_m43/（结束时保留，供复检）。
 """
 from __future__ import annotations
@@ -44,6 +50,13 @@ PASSWORD = "e2e-Password-123"
 FFMPEG = ""
 PROVIDER_STATE = {"video_submits": [], "video_polls": 0, "image_calls": [], "clip": b"", "png": b""}
 
+# --live：打真实 provider。LIVE 只影响"谁来当 provider"和"用谁的证据做断言"，
+# 不改变任何业务断言——真栈上仍然是同一套检查，只是花钱。
+LIVE = False
+VIDEO_TIMEOUT = 180.0
+LIVE_STATE = {"first_frame_ms": [], "video_job_ms": [], "download_bytes": 0}
+
+
 
 def log(message: str) -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -63,6 +76,22 @@ def ffmpeg_exe() -> str:
         found = shutil.which("ffmpeg")
         assert found, "本机没有 ffmpeg：请 pip install imageio-ffmpeg"
         return found
+
+
+def read_dotenv(path: Path) -> dict:
+    data = {}
+    if not path.exists():
+        return data
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        data[k.strip()] = v
+    return data
 
 
 def make_clip(path: Path, seconds: float = 2.0) -> None:
@@ -244,6 +273,24 @@ def wait_http(url: str, timeout: float = 60.0) -> None:
     raise RuntimeError(f"服务未就绪: {url}")
 
 
+def ops_usage(client, operation: str) -> dict:
+    """从我们自己的 /ops/usage 拿真实调用证据（真 provider 模式下没有假计数器）。"""
+    r = client.get("/ops/usage", params={"days": 1, "operation": operation})
+    assert r.status_code == 200, f"/ops/usage 失败 {r.status_code}: {r.text[:300]}"
+    return (r.json() or {}).get("total") or {}
+
+
+def ops_calls(client, operation: str) -> int:
+    return int(ops_usage(client, operation).get("calls") or 0)
+
+
+def video_spend_count(client) -> int:
+    """已发生的付费视频调用次数：假模式数假计数器，live 模式查 /ops/usage。"""
+    if LIVE:
+        return ops_calls(client, "video")
+    return len(PROVIDER_STATE["video_submits"])
+
+
 def poll_job(client, project_id: str, job_id: str, timeout: float = 180.0) -> dict:
     deadline = time.time() + timeout
     job = {}
@@ -256,7 +303,23 @@ def poll_job(client, project_id: str, job_id: str, timeout: float = 180.0) -> di
 
 
 def main() -> int:
-    global FFMPEG
+    global FFMPEG, LIVE, VIDEO_TIMEOUT
+
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true", help="打真实 provider（花费真实费用）")
+    ap.add_argument("--yes-spend", action="store_true", help="确认愿意花钱（--live 必需）")
+    ap.add_argument("--video-timeout", type=float, default=180.0, help="单条视频作业等待上限（秒）")
+    args = ap.parse_args()
+
+    LIVE = bool(args.live)
+    VIDEO_TIMEOUT = float(args.video_timeout)
+
+    if LIVE and not args.yes_spend:
+        print("拒绝执行 --live：真实 provider 会真实计费，需要同时传 --yes-spend。")
+        return 1
+
     FFMPEG = ffmpeg_exe()
     log(f"ffmpeg: {FFMPEG}")
 
@@ -264,6 +327,19 @@ def main() -> int:
         shutil.rmtree(DATA)
     UPLOADS.mkdir(parents=True, exist_ok=True)
     CELERY_DIR.mkdir(parents=True, exist_ok=True)
+
+    live_env = {}
+    if LIVE:
+        live_env = read_dotenv(REPO_ROOT / ".env")
+        key = (live_env.get("AGNES_API_KEY") or os.environ.get("AGNES_API_KEY") or "").strip()
+        if not key:
+            print("=" * 72)
+            print("BLOCKED：AGNES_API_KEY 为空，--live 无法取证。")
+            print("把 key 写进仓库根 .env 的 AGNES_API_KEY= 之后重跑；")
+            print("本脚本不会退回假 provider 来假装打通。")
+            print("=" * 72)
+            return 2
+        log(f"真实 provider 模式：base={live_env.get('AGNES_API_BASE', '(默认)')} key={key[:4]}***")
 
     clip = DATA / "provider_clip.mp4"
     png = DATA / "provider_frame.png"
@@ -285,10 +361,13 @@ def main() -> int:
                 return
             super().handle_error(request, client_address)
 
-    provider = QuietServer(("127.0.0.1", 0), FakeProvider)
-    provider_port = provider.server_port
-    threading.Thread(target=provider.serve_forever, daemon=True).start()
-    log(f"假 provider 起在 127.0.0.1:{provider_port}")
+    provider = None
+    provider_port = 0
+    if not LIVE:
+        provider = QuietServer(("127.0.0.1", 0), FakeProvider)
+        provider_port = provider.server_port
+        threading.Thread(target=provider.serve_forever, daemon=True).start()
+        log(f"假 provider 起在 127.0.0.1:{provider_port}")
 
     project_a, project_b = seed_database()
     log(f"已造项目 A={project_a} B={project_b}")
@@ -318,13 +397,20 @@ def main() -> int:
             "FFMPEG_PATH": FFMPEG,
             "LOG_LEVEL": "WARNING",
             "LOG_FORMAT": "plain",
-            "AI_IMAGE_PROVIDERS_RAW": image_chain,
-            "AI_VIDEO_PROVIDERS_RAW": video_chain,
             "AI_MOCK_ENABLED": "false",
             "RENDER_ALLOW_INLINE_VIDEO": "false",
             "AI_DAILY_QUOTA": "100",
         }
     )
+    if LIVE:
+        # 关键：live 模式**不覆盖** provider 链，让 config.py 用 .env 的 AGNES_* 自己拼；
+        # 只把 key/base/model 显式注入子进程（环境变量优先级高于 .env 文件）。
+        env.update({k: v for k, v in live_env.items() if k.startswith("AGNES_")})
+        env.pop("AI_IMAGE_PROVIDERS_RAW", None)
+        env.pop("AI_VIDEO_PROVIDERS_RAW", None)
+    else:
+        env["AI_IMAGE_PROVIDERS_RAW"] = image_chain
+        env["AI_VIDEO_PROVIDERS_RAW"] = video_chain
 
     server = subprocess.Popen(
         [str(PYTHON), "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8126"],
@@ -357,6 +443,7 @@ def main() -> int:
 
             # ---- 1. 出首帧（真 provider → 转存 → 镜头落 image_url）----
             frames = []
+            t_frames = time.time()
             for shot_id in shot_ids:
                 frame = client.post(
                     f"/projects/{project_a}/storyboard/shots/{shot_id}/first-frame", json={}
@@ -365,9 +452,15 @@ def main() -> int:
                 body = frame.json()
                 assert body.get("image_url"), f"首帧响应缺 image_url: {body}"
                 frames.append(body["image_url"])
-            assert len(PROVIDER_STATE["image_calls"]) == 2, (
-                f"应当调用两次图片 provider，实际 {len(PROVIDER_STATE['image_calls'])}"
-            )
+            if LIVE:
+                calls = ops_calls(client, "image")
+                assert calls >= 2, f"/ops/usage 只记到 {calls} 次 image 调用，少于 2 次"
+                log(f"真实出图调用已记账 {calls} 次（ops/usage） [OK]")
+            else:
+                assert len(PROVIDER_STATE["image_calls"]) == 2, (
+                    f"应当调用两次图片 provider，实际 {len(PROVIDER_STATE['image_calls'])}"
+                )
+            LIVE_STATE["first_frame_ms"].append(int((time.time() - t_frames) * 1000))
             log(f"两镜首帧已生成并落库: {frames[0][:60]}...")
 
             # 首帧必须真的进了本地存储（不是第三方临时链接）
@@ -385,18 +478,28 @@ def main() -> int:
                 assert created.status_code == 201, f"提交视频作业失败 {created.status_code}: {created.text[:600]}"
                 job = created.json()
                 log(f"作业已提交 {job['id']} status={job['status']}")
-                finished = poll_job(client, project_a, job["id"])
+                t_job = time.time()
+                finished = poll_job(client, project_a, job["id"], timeout=VIDEO_TIMEOUT)
+                LIVE_STATE["video_job_ms"].append(int((time.time() - t_job) * 1000))
                 assert finished["status"] == "completed", f"作业未完成: {finished}"
                 assert finished["video_url"], f"作业 completed 但无 video_url: {finished}"
                 assert not finished["warnings"], f"作业有告警（转存降级？）: {finished['warnings']}"
                 log(f"作业完成: {finished['video_url'][:60]}...")
 
-            submits = PROVIDER_STATE["video_submits"]
-            assert len(submits) == 2, f"视频 provider 应被调用 2 次，实际 {len(submits)}"
-            for payload in submits:
-                assert payload.get("image"), f"图生视频必须带 image 入参，实际 payload={payload}"
-                assert payload.get("num_frames") == 121, f"5s 应对应 121 帧，实际 {payload.get('num_frames')}"
-            log("每次提交都带首帧图 + 121 帧（真图生视频） [OK]")
+            if LIVE:
+                usage = ops_usage(client, "video")
+                assert int(usage.get("calls") or 0) >= 2, f"视频调用未记账: {usage}"
+                assert int(usage.get("success") or 0) >= 2, f"有视频调用未成功: {usage}"
+                log(f"真实视频调用已记账 {usage.get('calls')} 次 / success={usage.get('success')} [OK]")
+                log("注意：首帧图是否被 provider 真正采纳，本脚本无法证明——")
+                log("     必须另跑 scripts/m4_live_probe.py --shots s3 --image-mode <形态> 并人眼比对首帧。")
+            else:
+                submits = PROVIDER_STATE["video_submits"]
+                assert len(submits) == 2, f"视频 provider 应被调用 2 次，实际 {len(submits)}"
+                for payload in submits:
+                    assert payload.get("image"), f"图生视频必须带 image 入参，实际 payload={payload}"
+                    assert payload.get("num_frames") == 121, f"5s 应对应 121 帧，实际 {payload.get('num_frames')}"
+                log("每次提交都带首帧图 + 121 帧（真图生视频） [OK]")
 
             # 镜头回填：GET 镜头应能看到 signing 过的 video_url
             board2 = client.get(f"/projects/{project_a}/storyboard").json()
@@ -407,7 +510,7 @@ def main() -> int:
             log("两镜 video_url 已回填并签名 [OK]")
 
             # ---- 3. 渲染只消费产物：不得再调用付费视频生成 ----
-            before = len(PROVIDER_STATE["video_submits"])
+            before = video_spend_count(client)
             config = {
                 "resolution": "1080x1920", "aspect_ratio": "9:16", "fps": 24, "quality": "low",
                 "visual_style": "写实", "add_subtitles": True, "subtitle_source": "dialogue",
@@ -425,7 +528,7 @@ def main() -> int:
                     break
                 time.sleep(2)
             assert status.get("status") == "completed", f"渲染失败: {status.get('error_message')}"
-            assert len(PROVIDER_STATE["video_submits"]) == before, (
+            assert video_spend_count(client) == before, (
                 "渲染期间又调用了付费视频生成（RENDER_ALLOW_INLINE_VIDEO 没生效）"
             )
             log("渲染完成，且未再调用视频 provider [OK]")
@@ -439,13 +542,14 @@ def main() -> int:
             output = DATA / "output.mp4"
             output.write_bytes(media.content)
             assert output.stat().st_size > 10_000, "成片过小"
+            LIVE_STATE["download_bytes"] = output.stat().st_size
             probe = run([FFMPEG, "-hide_banner", "-i", str(output)]).stderr
             assert "1080x1920" in probe, f"分辨率不符: {probe[-400:]}"
             assert "Audio:" in probe, "成片没有音轨"
             log(f"成片校验通过: {output.stat().st_size} bytes, 1080x1920, 带音轨")
 
             # ---- 4. 未绑定素材的镜头：渲染必须报可操作错误，而不是偷偷扣费 ----
-            before = len(PROVIDER_STATE["video_submits"])
+            before = video_spend_count(client)
             payload_b = {"name": "E2E 未绑定", "config": config, "idempotency_key": str(uuid.uuid4())}
             submit_b = client.post(f"/projects/{project_b}/render", json=payload_b)
             assert submit_b.status_code == 201, submit_b.text[:400]
@@ -462,7 +566,7 @@ def main() -> int:
             assert "未绑定素材" in message or "先绑定素材" in message or "生成视频" in message, (
                 f"错误信息不可操作: {message}"
             )
-            assert len(PROVIDER_STATE["video_submits"]) == before, (
+            assert video_spend_count(client) == before, (
                 "未绑定素材时不应内联调用付费视频生成"
             )
             log(f"未绑定镜头报可操作错误且未扣费 [OK] -> {message[:80]}")
@@ -470,6 +574,23 @@ def main() -> int:
             worker_text = worker_log.read_text(encoding="utf-8", errors="ignore") if worker_log.exists() else ""
             assert "Traceback" not in worker_text, "worker 日志出现 Traceback（见 backend/data/e2e_m43/worker.log）"
             log("worker 日志无 Traceback [OK]")
+
+            if LIVE:
+                summary = {
+                    "mode": "live",
+                    "base": live_env.get("AGNES_API_BASE", ""),
+                    "first_frame_ms": LIVE_STATE["first_frame_ms"],
+                    "video_job_ms": LIVE_STATE["video_job_ms"],
+                    "output_bytes": LIVE_STATE["download_bytes"],
+                    "usage_image": ops_usage(client, "image"),
+                    "usage_video": ops_usage(client, "video"),
+                    "note": "estimated_cost_usd 用的是占位单价，真实账单只能以供应商后台为准",
+                }
+                path = DATA / "live_summary.json"
+                path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+                log(f"真实链路实测：首帧 {summary['first_frame_ms']} ms，"
+                    f"单条视频作业 {summary['video_job_ms']} ms，成片 {summary['output_bytes']} bytes")
+                log(f"用量明细 -> {path}")
             return 0
     finally:
         for process in (worker, server):
@@ -480,7 +601,8 @@ def main() -> int:
                 process.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 process.kill()
-        provider.shutdown()
+        if provider is not None:
+            provider.shutdown()
         log("已停止子进程（数据保留在 backend/data/e2e_m43/）")
 
 
