@@ -479,6 +479,17 @@ class RenderService:
                 progress_callback, 0.06, f"断点续渲：复用 {len(resume_urls)} 个已生成片段"
             )
 
+        # 一次性把"已完成的 AI 视频作业"查成 shot_id → video_url 的快照。
+        # 关键：渲染跑在 worker 里、每个镜头一个协程，逐镜头开 session 会慢且容易在
+        # SQLite 上打满连接；这里只查一次，随参数传给 _render_segments。
+        completed_videos = await self._completed_video_map(project_id)
+        if completed_videos:
+            await self._progress(
+                progress_callback,
+                0.07,
+                f"复用 {len(completed_videos)} 个已完成的 AI 视频作业",
+            )
+
         temp_dir = tempfile.mkdtemp(prefix="render_")
         try:
             segments = await self._render_segments(
@@ -489,6 +500,7 @@ class RenderService:
                 cancel_check,
                 resume_urls,
                 project_id,
+                completed_videos,
             )
             results["segments"] = segments
             results["errors"].extend(
@@ -661,6 +673,9 @@ class RenderService:
                     ref = str(s.scene_ref or "").strip()
                     shots.append(
                         {
+                            # id 是"把镜头和 AI 视频作业对上"的唯一键（_pick_source 消费
+                            # ai_video_jobs 时按 shot_id 匹配），漏掉就只能退回内联生成
+                            "id": s.id,
                             "shot_number": s.shot_number,
                             "label": s.label,
                             "description": s.description,
@@ -676,6 +691,52 @@ class RenderService:
             logger.exception("[Render] 读取分镜失败: %s", exc)
             return []
 
+    async def _completed_video_map(self, project_id: str) -> dict:
+        """项目下"已完成且有成片"的 AI 视频作业：shot_id → video_url。
+
+        M4-3 起视频生成是异步作业（ai_video_jobs），渲染只消费已有产物。这里在
+        **一次连接里**把整张映射查出来给所有镜头共用：
+
+          * 逐镜头查询会在并发上限 RENDER_CONCURRENCY 下开一堆 session，SQLite
+            下尤其容易锁等待，而这份数据在整轮渲染里不会变；
+          * 只认 status=completed 且 video_url 非空：pending/polling 还在计费且没有
+            地址，failed/timeout/cancelled 没有可用产物；
+          * 同一镜头多条完成记录时按 created_at 升序遍历、后者覆盖前者 —— 保证
+            "重新生成"之后拿到的是最新那条，而不是第一次生成的旧片段。
+        """
+        from sqlalchemy import select
+
+        from app.core.database import async_session
+        from app.models.video_job import AIVideoJob
+
+        try:
+            async with async_session() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            AIVideoJob.shot_id,
+                            AIVideoJob.video_url,
+                            AIVideoJob.created_at,
+                        )
+                        .where(
+                            AIVideoJob.project_id == project_id,
+                            AIVideoJob.status == "completed",
+                            AIVideoJob.shot_id.is_not(None),
+                        )
+                        .order_by(AIVideoJob.created_at.asc())
+                    )
+                ).all()
+        except Exception as exc:  # noqa: BLE001 - 读不到作业按"没有产物"处理，不拖垮渲染
+            logger.warning("[Render] 读取 AI 视频作业失败（按未绑定处理）: %s", exc)
+            return {}
+
+        mapping: dict = {}
+        for shot_id, video_url, _created_at in rows:
+            url = (video_url or "").strip()
+            if shot_id and url:
+                mapping[str(shot_id)] = url
+        return mapping
+
     async def _render_segments(
         self,
         shots: List[dict],
@@ -685,6 +746,7 @@ class RenderService:
         cancel_check: Optional[CancelCheck],
         resume_urls: dict,
         project_id: str,
+        completed_videos: Optional[dict] = None,
     ) -> List[dict]:
         total = len(shots)
         semaphore = asyncio.Semaphore(int(settings.RENDER_CONCURRENCY or 3))
@@ -702,7 +764,7 @@ class RenderService:
                     )
                 try:
                     video_url, source_kind = await self._pick_source(
-                        shot, resume_urls, spec, project_id
+                        shot, resume_urls, spec, project_id, completed_videos
                     )
                     await self._check_cancel(cancel_check)
                     segment_path = await self._stage_segment(
@@ -764,13 +826,23 @@ class RenderService:
         return segments
 
     async def _pick_source(
-        self, shot: dict, resume_urls: dict, spec: RenderSpec, project_id: str
+        self,
+        shot: dict,
+        resume_urls: dict,
+        spec: RenderSpec,
+        project_id: str,
+        completed_videos: Optional[dict] = None,
     ) -> Tuple[str, str]:
-        """按优先级决定镜头素材：显式绑定 > 断点 > AI 生成。
+        """按优先级决定镜头素材：显式绑定 > 断点 > 已完成视频作业 > （可选）内联生成。
 
         M4-1：AI 生成的视频必须立刻转存到我们自己的存储再进断点。provider 的
         CDN 链接有 TTL（常见 1 小时），旧实现把它直接写进 checkpoint —— 断点续渲
         复用 24 小时前的片段时必然 404，等于"断点续渲"在最贵的路径上失效。
+
+        M4-3：视频生成改成异步作业制，渲染任务不再同步调用付费生成 —— 一次渲染
+        要串起 N 个镜头，单条视频可能要轮询几分钟，塞在渲染里会占死 worker 并让
+        进度长时间停在同一镜头。默认（RENDER_ALLOW_INLINE_VIDEO=False）只消费
+        已完成产物，没有就让用户去分镜页生成，报错文案要能直接指导操作。
         """
         explicit = (shot.get("video_url") or "").strip()
         if explicit:
@@ -787,6 +859,26 @@ class RenderService:
             kind = self._source_kind(resumed)
             if kind:
                 return resumed, kind[0]
+
+        # 分镜页生成的 AI 视频作业（图生视频的产物）。shot_id 是唯一关联键，
+        # 缺失（老数据/被删镜头）时无法匹配，只能走下面的错误或内联分支。
+        shot_id = str(shot.get("id") or "").strip()
+        job_url = (completed_videos or {}).get(shot_id, "") if shot_id else ""
+        if job_url:
+            kind = self._source_kind(job_url)
+            if kind:
+                return job_url, kind[0]
+            logger.warning(
+                "[Render] 镜头 %s 的已完成作业地址不可用，按未绑定处理: %s",
+                shot.get("shot_number"),
+                job_url[:120],
+            )
+
+        if not settings.RENDER_ALLOW_INLINE_VIDEO:
+            raise RenderStepError(
+                f"镜头 {shot.get('shot_number')} 未绑定素材",
+                "请先在分镜页生成视频或绑定素材（渲染任务不再同步调用付费视频生成）",
+            )
 
         try:
             generated = await ai_service.generate_video(

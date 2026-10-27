@@ -12,7 +12,9 @@ celery_app = Celery(
     "ai_short_drama_studio",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["app.tasks.render_task"],
+    # 自动发现只会找 app/tasks/tasks.py（不存在），所以任务模块必须显式列进来：
+    # 漏一个，对应的 .delay() 在生产上就是 "Received unregistered task"。
+    include=["app.tasks.render_task", "app.tasks.video_job_task"],
 )
 
 # Celery 配置

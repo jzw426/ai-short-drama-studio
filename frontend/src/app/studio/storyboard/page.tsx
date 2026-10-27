@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { ShotMediaPanel } from "@/components/ShotMediaPanel";
 import { StoryboardCanvas } from "@/components/StoryboardCanvas";
 import {
   assetApi,
@@ -39,6 +40,8 @@ interface ShotDraft {
   scene_ref: string;
   character_refs: string;
   video_url: string;
+  /** 喂给视频模型的提示词（M4-3）：与人看的 description 分开维护 */
+  video_prompt: string;
 }
 
 function toDraft(shot: ShotDto): ShotDraft {
@@ -51,6 +54,7 @@ function toDraft(shot: ShotDto): ShotDraft {
     scene_ref: shot.scene_ref ?? "",
     character_refs: (shot.character_refs ?? []).join("、"),
     video_url: shot.video_url ?? "",
+    video_prompt: shot.video_prompt ?? "",
   };
 }
 
@@ -159,6 +163,7 @@ export default function StoryboardPage() {
         scene_ref: draft.scene_ref.trim() || null,
         character_refs: parseList(draft.character_refs),
         video_url: draft.video_url.trim() || null,
+        video_prompt: draft.video_prompt.trim() || null,
       });
       toast.success("镜头已保存");
       setEditingId(null);
@@ -525,6 +530,15 @@ export default function StoryboardPage() {
                         </div>
                       </div>
 
+                      {/* 首帧 + 出视频 + 作业进度（M4-3）：与编辑区分离，收起时也可见 */}
+                      <div className="pl-8">
+                        <ShotMediaPanel
+                          projectId={project.id}
+                          shot={shot}
+                          onShotsChanged={load}
+                        />
+                      </div>
+
                       {expanded && draft && (
                         <div className="rounded-lg border border-surface-200 p-3 space-y-2 bg-surface-50/60">
                           <div className="grid grid-cols-2 gap-2">
@@ -582,6 +596,21 @@ export default function StoryboardPage() {
                               rows={2}
                               className="input-field w-full text-sm resize-y"
                               placeholder="镜头画面内容"
+                            />
+                          </label>
+
+                          <label className="space-y-1 block">
+                            <span className="text-xs text-surface-500">
+                              视频提示词（可选，留空用画面描述）
+                            </span>
+                            <textarea
+                              value={draft.video_prompt}
+                              onChange={(e) =>
+                                setDraft({ ...draft, video_prompt: e.target.value })
+                              }
+                              rows={2}
+                              className="input-field w-full text-sm resize-y"
+                              placeholder="给视频模型的结构化描述，例如：雨夜街头，女主撑伞回头，镜头缓慢推近"
                             />
                           </label>
 
@@ -669,7 +698,7 @@ export default function StoryboardPage() {
           </div>
 
           <div className="px-4 py-2 border-t border-surface-100 text-xs text-surface-400">
-            分镜画面在右侧画布编排，画布状态自动保存
+            分镜画面在右侧画布编排；每个镜头可先「出首帧」再「出视频」，产物自动落库
           </div>
         </aside>
 

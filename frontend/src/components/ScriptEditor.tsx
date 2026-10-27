@@ -6,6 +6,7 @@ import {
   ArrowDown,
   ArrowUp,
   FileText,
+  Images,
   Loader2,
   Plus,
   Save,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { SceneAssetPanel } from "@/components/SceneAssetPanel";
 import { scriptApi, type SceneDto, type ScriptDto } from "@/lib/api";
 import { TIME_OF_DAY_SUGGESTIONS } from "@/lib/labels";
 
@@ -24,6 +26,23 @@ interface ScriptEditorProps {
 /** 后端 word_count 是 Python len(content)（按 Unicode 码点计），这里保持一致 */
 function countWords(text: string): number {
   return Array.from(text).length;
+}
+
+/**
+ * 场景资产/镜头的匹配标识。
+ *
+ * 后端「从剧本生成分镜」时 shot.scene_ref 直接取 scene.title
+ * （backend/app/api/routes/storyboards.py），render_service 也按 title 匹配台词。
+ * 所以这里必须**逐字相同**：只 trim，绝不自造回退值（比如 "#序号"），
+ * 否则剧本页生成的四视图和分镜里的 scene_ref 永远对不上、出首帧复用不到。
+ */
+export function sceneRefOf(scene: SceneDto): string {
+  return (scene.title ?? "").trim();
+}
+
+/** 场景标题为空时无法与分镜 scene_ref 对齐，入口要给原因而不是静默失败。 */
+export function sceneRefReady(scene: SceneDto): boolean {
+  return sceneRefOf(scene).length > 0;
 }
 
 function sortScenes(list: SceneDto[]): SceneDto[] {
@@ -62,10 +81,17 @@ export function ScriptEditor({ projectId }: ScriptEditorProps) {
   const [aiOpen, setAiOpen] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiGenerating, setAiGenerating] = useState(false);
+  /** 打开四视图弹窗的场景 id（null=关闭） */
+  const [assetSceneId, setAssetSceneId] = useState<string | null>(null);
 
   const activeScene = useMemo(
     () => scenes.find((s) => s.id === activeSceneId) ?? null,
     [scenes, activeSceneId]
+  );
+
+  const assetScene = useMemo(
+    () => scenes.find((s) => s.id === assetSceneId) ?? null,
+    [scenes, assetSceneId]
   );
 
   const wordCount = useMemo(() => countWords(content), [content]);
@@ -523,6 +549,21 @@ export function ScriptEditor({ projectId }: ScriptEditorProps) {
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
+                              setAssetSceneId(scene.id);
+                            }}
+                            disabled={!sceneRefReady(scene)}
+                            title={
+                              sceneRefReady(scene)
+                                ? "场景四视图"
+                                : "先填写场景标题：分镜的 scene_ref 取的就是标题，没有标题就对不上"
+                            }
+                            className="p-1 rounded hover:bg-surface-200 text-surface-400 hover:text-primary-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            <Images size={12} />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
                               void moveScene(index, -1);
                             }}
                             disabled={index === 0}
@@ -595,6 +636,19 @@ export function ScriptEditor({ projectId }: ScriptEditorProps) {
                         <Save size={14} />
                       )}
                       保存场景
+                    </button>
+                    <button
+                      onClick={() => setAssetSceneId(activeScene.id)}
+                      disabled={!sceneRefReady(activeScene)}
+                      title={
+                        sceneRefReady(activeScene)
+                          ? "生成这个场景的四视图；出首帧时作为参考图，保证同一场景不换建筑/换灯光"
+                          : "先填写场景标题并保存：分镜的 scene_ref 取的就是标题"
+                      }
+                      className="btn-outline flex items-center gap-2 text-sm disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Images size={14} />
+                      四视图
                     </button>
                     <button
                       onClick={() => void deleteScene(activeScene)}
@@ -707,6 +761,17 @@ export function ScriptEditor({ projectId }: ScriptEditorProps) {
             )}
           </div>
         </div>
+      )}
+
+      {/* 场景四视图弹窗：按场景打开，关闭即卸载（请求/定时器随组件销毁） */}
+      {assetScene && (
+        <SceneAssetPanel
+          projectId={projectId}
+          sceneRef={sceneRefOf(assetScene)}
+          sceneNumber={assetScene.scene_number}
+          sceneTitle={assetScene.title}
+          onClose={() => setAssetSceneId(null)}
+        />
       )}
     </div>
   );

@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+from app.core.config import settings
 from app.services.render_service import (
     RenderCancelled,
     RenderService,
@@ -191,21 +192,27 @@ async def test_render_segments_reuses_checkpoint_without_ai(service, monkeypatch
 
 @pytest.mark.asyncio
 async def test_render_segments_explains_unbound_shot(service, monkeypatch, tmp_path):
-    """没有绑定素材、AI 又不可用时，错误必须能定位到镜头和原因（不许静默 200）。"""
+    """没有绑定素材、也没有已完成作业时，错误必须能定位到镜头并给出可执行的下一步。
 
-    async def unavailable(**kwargs):
-        raise RENDER_MODULE.AIUnavailableError("所有 provider 均不可用")
+    M4-3：渲染不再同步调付费生成（RENDER_ALLOW_INLINE_VIDEO 默认 False），所以这里
+    连 AI 都不该被碰一下 —— boom 一旦被调用就说明又偷偷走了内联分支。
+    """
+    monkeypatch.setattr(settings, "RENDER_ALLOW_INLINE_VIDEO", False)
 
-    monkeypatch.setattr(RENDER_MODULE.ai_service, "generate_video", unavailable)
+    async def boom(**kwargs):
+        raise AssertionError("渲染链路不应同步调用 AI 视频生成")
+
+    monkeypatch.setattr(RENDER_MODULE.ai_service, "generate_video", boom)
 
     spec, _ = build_spec({})
-    shots = [{"shot_number": 2, "duration": 3.0, "description": "d", "label": "l"}]
+    shots = [{"id": "shot-2", "shot_number": 2, "duration": 3.0, "description": "d", "label": "l"}]
     segments = await service._render_segments(
         shots, str(tmp_path), spec, None, None, {}, "p1"
     )
     assert segments[0]["status"] == "failed"
     assert "镜头 2" in segments[0]["error"]
     assert "未绑定素材" in segments[0]["error"]
+    assert "请先在分镜页生成视频" in segments[0]["error"]
 
 
 @pytest.mark.asyncio
@@ -233,6 +240,8 @@ async def test_ai_video_is_persisted_before_entering_checkpoint(
             fh.write(b"fake")
         return path
 
+    # 内联生成现在是显式开关（M4-3 默认关闭），这条用例测的正是"打开时"的转存
+    monkeypatch.setattr(settings, "RENDER_ALLOW_INLINE_VIDEO", True)
     monkeypatch.setattr(RENDER_MODULE.ai_service, "generate_video", fake_generate)
     monkeypatch.setattr(RENDER_MODULE, "persist_remote_media", fake_persist)
     monkeypatch.setattr(service, "_stage_segment", fake_stage)
@@ -247,6 +256,62 @@ async def test_ai_video_is_persisted_before_entering_checkpoint(
     assert seen["prefix"].startswith("ai/videos/p9/")
     assert segments[0]["video_url"] == "/uploads/ai/videos/p9/persisted.mp4"
     assert segments[0]["source"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_render_segments_consumes_completed_job_map_without_ai(
+    service, monkeypatch, tmp_path
+):
+    """M4-3：已完成作业的产物直接进渲染，既不调 AI 也不该漏到内联分支。"""
+    monkeypatch.setattr(settings, "RENDER_ALLOW_INLINE_VIDEO", False)
+
+    async def boom(**kwargs):
+        raise AssertionError("已有完成作业时不应再调用 AI 视频生成")
+
+    async def fake_stage(url, temp_dir, idx, source_kind):
+        path = os.path.join(temp_dir, f"segment_{idx:03d}.mp4")
+        with open(path, "wb") as fh:
+            fh.write(b"fake")
+        return path
+
+    monkeypatch.setattr(RENDER_MODULE.ai_service, "generate_video", boom)
+    monkeypatch.setattr(service, "_stage_segment", fake_stage)
+
+    spec, _ = build_spec({})
+    shots = [{"id": "shot-a", "shot_number": 1, "duration": 3.0, "label": "l"}]
+    segments = await service._render_segments(
+        shots,
+        str(tmp_path),
+        spec,
+        None,
+        None,
+        {},
+        "p1",
+        {"shot-a": "/uploads/ai/videos/p1/done.mp4"},
+    )
+    assert segments[0]["status"] == "success"
+    assert segments[0]["video_url"] == "/uploads/ai/videos/p1/done.mp4"
+
+
+@pytest.mark.asyncio
+async def test_pick_source_prefers_completed_job_over_inline_generation(
+    service, monkeypatch
+):
+    """优先级：已完成作业 > 内联生成（同一镜头两边都有产物时不能重复付费）。"""
+    monkeypatch.setattr(settings, "RENDER_ALLOW_INLINE_VIDEO", True)
+
+    async def boom(**kwargs):
+        raise AssertionError("已有完成作业时不应再调用 AI 视频生成")
+
+    monkeypatch.setattr(RENDER_MODULE.ai_service, "generate_video", boom)
+
+    spec, _ = build_spec({})
+    shot = {"id": "shot-a", "shot_number": 1, "duration": 3.0, "label": "l"}
+    url, kind = await service._pick_source(
+        shot, {}, spec, "p1", {"shot-a": "/uploads/ai/videos/p1/done.mp4"}
+    )
+    assert url == "/uploads/ai/videos/p1/done.mp4"
+    assert kind == "local"
 
 
 def test_source_kind_rejects_escape_and_foreign_schemes(service):

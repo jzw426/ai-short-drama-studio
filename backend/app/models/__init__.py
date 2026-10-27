@@ -6,6 +6,8 @@ from app.models.character import Character
 from app.models.asset import Asset, RenderTask
 from app.models.user import User
 from app.models.ai_usage import AIUsage, AIUsageEvent
+from app.models.video_job import AIVideoJob
+from app.models.scene_asset import SceneAsset
 
 __all__ = [
     "Project",
@@ -20,4 +22,6 @@ __all__ = [
     "User",
     "AIUsage",
     "AIUsageEvent",
+    "AIVideoJob",
+    "SceneAsset",
 ]

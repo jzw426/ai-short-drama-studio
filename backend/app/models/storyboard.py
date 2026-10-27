@@ -48,6 +48,12 @@ class Shot(Base):
     # 为空时渲染才回退到 AI 视频生成 —— 旧实现没有这一列，等于每个镜头都必须调用
     # 付费 AI，没有 API Key 时系统永远出不了片。
     video_url: Mapped[str] = mapped_column(String(2048), nullable=True)
+    # 首帧图（M4-3）：图生视频的入参。出图时用角色锁脸参考图 + 场景四视图保证
+    # 同一镜头在第一帧就不崩；为空时才退回纯文生视频。
+    image_url: Mapped[str] = mapped_column(String(2048), nullable=True)
+    # 视频提示词（M4-3）：与 description 分离——description 是给人看的运镜描述，
+    # 这里是喂给视频模型的英文/结构化提示词，互不污染。
+    video_prompt: Mapped[str] = mapped_column(Text, nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 

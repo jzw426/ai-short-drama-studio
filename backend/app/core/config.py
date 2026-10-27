@@ -267,6 +267,12 @@ class Settings(BaseSettings):
 
     # 渲染并发度（并行生成视频片段的上限，避免触发 API 限流）
     RENDER_CONCURRENCY: int = 3
+    # 渲染时是否允许"同步调用付费视频生成"（M4-3 起默认关闭）。
+    # 视频生成改成了异步作业制（ai_video_jobs：提交 → 轮询 → 成片），单条可能要
+    # 轮询几分钟；把它塞在渲染任务里会占死 worker、进度长时间停在同一镜头，还会
+    # 撞上渲染看门狗超时。现在渲染只消费"已完成产物或显式绑定素材"，内联生成只
+    # 作为兼容旧数据/本地冒烟的开关保留。
+    RENDER_ALLOW_INLINE_VIDEO: bool = False
 
     # CORS
     CORS_ORIGINS: list = ["http://localhost:3000", "http://127.0.0.1:3000"]

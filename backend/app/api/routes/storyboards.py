@@ -4,13 +4,16 @@ from typing import List
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.media_urls import signed_media_url
 from app.models.storyboard import Storyboard, Shot
 from app.core.quota import acquire_ai_quota_or_429, refund_ai_quota_and_commit
 from app.services.ai_service import AIUnavailableError, ai_service
+from app.services.first_frame import generate_first_frame, load_shot_characters
 from app.models.project import Project
 from app.models.user import User
 from app.schemas.storyboard import (
     StoryboardUpdate, StoryboardResponse, ShotCreate, ShotUpdate, ShotResponse,
+    FirstFrameRequest, FirstFrameResponse, VideoPromptUpdate,
 )
 
 router = APIRouter(tags=["Storyboards"])
@@ -76,7 +79,39 @@ async def get_storyboard(
         )
         storyboard = result.scalar_one()
 
-    return storyboard
+    return await _storyboard_response(storyboard)
+
+
+async def _shot_response(shot: Shot) -> ShotResponse:
+    """ORM 镜头 → 响应模型，并把媒体字段换成可访问的签名链接。
+
+    为什么要单独一步：库里存的是规范 URL（本地模式是 /uploads/...，对象存储是
+    s3://bucket/key），直接吐给前端会 403/404；签名后前端才能预览首帧与素材。
+    """
+    response = ShotResponse.model_validate(shot)
+    response.image_url = await signed_media_url(shot.image_url)
+    response.video_url = await signed_media_url(shot.video_url)
+    return response
+
+
+async def _storyboard_response(storyboard: Storyboard) -> StoryboardResponse:
+    response = StoryboardResponse.model_validate(storyboard)
+    response.shots = [await _shot_response(shot) for shot in (storyboard.shots or [])]
+    return response
+
+
+async def _get_shot_or_404(
+    db: AsyncSession, storyboard_id: str, shot_id: str
+) -> Shot:
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(Shot).where(Shot.id == shot_id, Shot.storyboard_id == storyboard_id)
+    )
+    shot = result.scalar_one_or_none()
+    if not shot:
+        raise HTTPException(status_code=404, detail="镜头不存在")
+    return shot
 
 
 @router.put("/projects/{project_id}/storyboard", response_model=StoryboardResponse)
@@ -102,7 +137,7 @@ async def update_storyboard(
         .where(Storyboard.id == storyboard.id)
         .options(selectinload(Storyboard.shots))
     )
-    return result.scalar_one()
+    return await _storyboard_response(result.scalar_one())
 
 
 # ===== 镜头管理 =====
@@ -122,7 +157,7 @@ async def list_shots(
         .where(Shot.storyboard_id == storyboard.id)
         .order_by(Shot.sort_order)
     )
-    return list(result.scalars().all())
+    return [await _shot_response(shot) for shot in result.scalars().all()]
 
 
 @router.post("/projects/{project_id}/storyboard/shots", response_model=ShotResponse, status_code=201)
@@ -146,12 +181,14 @@ async def create_shot(
         scene_ref=data.scene_ref,
         character_refs=data.character_refs,
         video_url=data.video_url,
+        image_url=data.image_url,
+        video_prompt=data.video_prompt,
         sort_order=data.sort_order,
     )
     db.add(shot)
     await db.flush()
     await db.refresh(shot)
-    return shot
+    return await _shot_response(shot)
 
 
 @router.put("/projects/{project_id}/storyboard/shots/{shot_id}", response_model=ShotResponse)
@@ -179,7 +216,63 @@ async def update_shot(
 
     await db.flush()
     await db.refresh(shot)
-    return shot
+    return await _shot_response(shot)
+
+
+@router.post(
+    "/projects/{project_id}/storyboard/shots/{shot_id}/first-frame",
+    response_model=FirstFrameResponse,
+)
+async def generate_shot_first_frame(
+    project_id: str,
+    shot_id: str,
+    data: FirstFrameRequest = FirstFrameRequest(),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """生成（或复用）镜头首帧图。
+
+    首帧是图生视频的输入：前端"生成视频"按钮会先确保有这个产物，再提交异步
+    AI 视频作业。默认 regenerate=False 表示"有就复用"，只有显式要求才重新出图并扣配额。
+    """
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+    shot = await _get_shot_or_404(db, storyboard.id, shot_id)
+    characters = await load_shot_characters(db, project_id, shot)
+    result = await generate_first_frame(
+        db,
+        project_id,
+        shot,
+        characters,
+        regenerate=bool(data.regenerate),
+        user_id=current_user.id,
+    )
+    result["image_url"] = await signed_media_url(result.get("image_url"))
+    return result
+
+
+@router.post(
+    "/projects/{project_id}/storyboard/shots/{shot_id}/video-prompt",
+    response_model=ShotResponse,
+)
+async def update_shot_video_prompt(
+    project_id: str,
+    shot_id: str,
+    data: VideoPromptUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """固化该镜头的视频提示词。
+
+    单独一个端点而不是复用 PUT shots/{id}：前端"生成视频"要一次性把提示词落库，
+    走通用 PATCH 会把整个镜头所有字段一起写回，并发编辑时容易互相覆盖；
+    这里只动 video_prompt 一个字段。
+    """
+    storyboard = await _get_storyboard_or_create(project_id, current_user.id, db)
+    shot = await _get_shot_or_404(db, storyboard.id, shot_id)
+    shot.video_prompt = (data.video_prompt or "").strip()
+    await db.flush()
+    await db.refresh(shot)
+    return await _shot_response(shot)
 
 
 @router.delete("/projects/{project_id}/storyboard/shots/{shot_id}", status_code=204)
@@ -350,6 +443,8 @@ async def export_storyboard(
                 "scene_ref": s.scene_ref,
                 "character_refs": s.character_refs or [],
                 "video_url": s.video_url or "",
+                "image_url": s.image_url or "",
+                "video_prompt": s.video_prompt or "",
             }
             for s in shots
         ],

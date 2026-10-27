@@ -95,7 +95,19 @@ def render_env(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "FFPROBE_PATH", str(tmp_path / "no-ffprobe"))
 
     from app.core.database import Base
-    from app.models import asset, ai_usage, character, project, script, storyboard, user  # noqa: F401
+    # 必须把 models 全量 import 一遍：create_all 只建已注册到 Base.metadata 的表，
+    # 漏掉 video_job/scene_asset 会让渲染读 ai_video_jobs 时炸 "no such table"。
+    from app.models import (  # noqa: F401
+        ai_usage,
+        asset,
+        character,
+        project,
+        scene_asset,
+        script,
+        storyboard,
+        user,
+        video_job,
+    )
 
     import types
 
@@ -267,17 +279,22 @@ async def test_execute_render_soft_subtitles_muxs_track(render_env):
 
 @pytest.mark.asyncio
 async def test_execute_render_reports_unbound_shot(render_env, monkeypatch):
-    """没绑定素材又没有 AI Key：必须给出"镜头 N 未绑定素材"，而不是空 200。"""
+    """没绑定素材、也没有已完成作业：必须给出可操作错误，且一次 AI 都不调。
+
+    M4-3 之前这里靠"AI 不可用"才失败（相当于默认就会去付费生成）；现在渲染是纯
+    消费端，boom 一旦被触发就说明内联分支又被打开了。
+    """
     import sys
 
     from app.services.render_service import render_service
 
     render_module = sys.modules["app.services.render_service"]
 
-    async def unavailable(**kwargs):
-        raise render_module.AIUnavailableError("所有 provider 均不可用")
+    async def boom(**kwargs):
+        raise AssertionError("渲染不应同步调用 AI 视频生成（RENDER_ALLOW_INLINE_VIDEO=False）")
 
-    monkeypatch.setattr(render_module.ai_service, "generate_video", unavailable)
+    monkeypatch.setattr(render_module.ai_service, "generate_video", boom)
+    monkeypatch.setattr(render_module.settings, "RENDER_ALLOW_INLINE_VIDEO", False)
 
     env = render_env
     project_id = await _seed(env, with_video=False, dialogue="")
@@ -288,3 +305,81 @@ async def test_execute_render_reports_unbound_shot(render_env, monkeypatch):
 
     assert results["status"] == "failed"
     assert any("未绑定素材" in e for e in results["errors"])
+    # M4-3：渲染不再同步生成视频，错误要告诉用户去哪儿补素材
+    assert any("请先在分镜页生成视频" in e for e in results["errors"])
+
+
+async def _seed_completed_jobs(env, project_id: str, urls: dict) -> None:
+    """给已有镜头挂"已完成"的 AI 视频作业（模拟分镜页已经生成好视频）。"""
+    from sqlalchemy import select
+
+    from app.core.time_utils import utc_now
+    from app.models.storyboard import Shot, Storyboard
+    from app.models.video_job import AIVideoJob
+
+    async with env.factory() as session:
+        shots = (
+            (
+                await session.execute(
+                    select(Shot)
+                    .join(Storyboard, Storyboard.id == Shot.storyboard_id)
+                    .where(Storyboard.project_id == project_id)
+                    .order_by(Shot.sort_order)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for shot in shots:
+            url = urls.get(shot.shot_number)
+            if not url:
+                continue
+            session.add(
+                AIVideoJob(
+                    project_id=project_id,
+                    shot_id=shot.id,
+                    prompt="",
+                    status="completed",
+                    video_url=url,
+                    created_at=utc_now(),
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_execute_render_consumes_completed_ai_video_jobs(render_env, monkeypatch):
+    """M4-3 主线：镜头只挂了已完成作业（没绑 video_url）也能渲出成片，且不调 AI。"""
+    import sys
+
+    from app.services.render_service import render_service
+
+    render_module = sys.modules["app.services.render_service"]
+
+    async def boom(**kwargs):
+        raise AssertionError("渲染不应同步调用 AI 视频生成")
+
+    monkeypatch.setattr(render_module.ai_service, "generate_video", boom)
+    monkeypatch.setattr(render_module.settings, "RENDER_ALLOW_INLINE_VIDEO", False)
+
+    env = render_env
+    project_id = await _seed(env, with_video=False, dialogue="")
+    urls = {
+        number: f"/uploads/ai/videos/{project_id}/job{number}.mp4" for number in (1, 2)
+    }
+    for url in urls.values():
+        _make_clip(env.uploads / url[len("/uploads/"):], seconds=1.0)
+    await _seed_completed_jobs(env, project_id, urls)
+
+    results = await render_service.execute_render(
+        "task-jobs", project_id, {"add_subtitles": False}
+    )
+
+    assert results["status"] == "completed", results.get("errors")
+    assert not results["errors"], results["errors"]
+    by_number = {s["shot_number"]: s for s in results["segments"]}
+    assert by_number[1]["status"] == "success"
+    assert by_number[2]["status"] == "success"
+    # 片段来源必须是作业里那条产物地址（没有被内联生成覆盖）
+    assert by_number[1]["video_url"] == urls[1]
+    assert by_number[2]["video_url"] == urls[2]

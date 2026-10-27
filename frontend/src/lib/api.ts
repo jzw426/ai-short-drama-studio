@@ -32,6 +32,39 @@ export function mediaUrl(url?: string | null): string | undefined {
   return url;
 }
 
+/**
+ * 带 HTTP 状态码的接口错误。
+ *
+ * 为什么不能再用裸 Error：AI 类接口的错误语义完全由状态码决定
+ * （429=配额用尽、503=AI 不可用、501/502=供应商不支持该能力），
+ * 而 axios 只把文案塞进 detail，页面拿到 Error 后无法区分
+ * "配额用尽"和"供应商不支持"，只能把原文案糊在 toast 里。
+ */
+export class ApiError extends Error {
+  /** HTTP 状态码；网络中断/超时（无响应）时为 undefined */
+  readonly status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+/** 取接口错误的 HTTP 状态码；非接口错误（如本地抛错）返回 undefined */
+export function apiStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" ? status : undefined;
+}
+
+/** 取用户可读的错误文案（Error.message；空则回退 fallback） */
+export function apiMessage(error: unknown, fallback = "请求失败"): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error) return error;
+  return fallback;
+}
+
 // 响应拦截器
 api.interceptors.response.use(
   (response) => response.data,
@@ -46,7 +79,12 @@ api.interceptors.response.use(
     const message =
       error.response?.data?.detail || error.message || "请求失败";
     console.error(`[API Error] ${message}`);
-    return Promise.reject(new Error(message));
+    return Promise.reject(
+      new ApiError(
+        typeof message === "string" ? message : "请求失败",
+        error.response?.status
+      )
+    );
   }
 );
 
@@ -132,6 +170,151 @@ export const storyboardApi = {
   // 导出分镜（JSON）
   exportJson: (projectId: string) =>
     api.get(`/projects/${projectId}/storyboard/export`),
+  /**
+   * 出首帧图（M4-3）：以角色锁脸参考图 + 场景四视图为参考图生成该镜头的第一帧。
+   *
+   * regenerate=true 表示已有首帧、重新生成（旧图会被覆盖）。
+   * 超时放宽到 600s：一次出图要串行注入多张参考图，后端单次 httpx 就要 300s，
+   * 30s 默认值会让前端先断而后端仍在跑、配额已扣。
+   */
+  generateFirstFrame: (
+    projectId: string,
+    shotId: string,
+    data: { regenerate?: boolean } = {}
+  ) =>
+    api.post(
+      `/projects/${projectId}/storyboard/shots/${shotId}/first-frame`,
+      { regenerate: data.regenerate ?? false },
+      { timeout: 600000 }
+    ),
+};
+
+// ===== 视频作业 API（M4-3） =====
+
+/** 作业状态：pending/submitted/polling 为进行中，其余为终态 */
+export type VideoJobStatus =
+  | "pending"
+  | "submitted"
+  | "polling"
+  | "completed"
+  | "failed"
+  | "timeout"
+  | "cancelled";
+
+/** 出首帧的响应：落库后的签名地址 + 实际使用的提示词 + 注入的角色 */
+export interface FirstFrameDto {
+  image_url: string;
+  prompt: string;
+  characters_used: string[];
+}
+
+/** 后端 VideoJobResponse（snake_case） */
+export interface VideoJobDto {
+  id: string;
+  project_id?: string;
+  shot_id?: string | null;
+  status: VideoJobStatus;
+  /** 成功的规范化地址（已转存自有存储） */
+  video_url?: string | null;
+  /** 失败原因（后端原样透出供应商报错摘要） */
+  error?: string | null;
+  /** 后端已轮询次数，仅用于展示/排障，前端不要据此判断超时 */
+  poll_count: number;
+  prompt?: string | null;
+  image_url?: string | null;
+  duration?: number | null;
+  provider?: string;
+  model?: string;
+  /** 转存降级等非致命告警（第三方链接有 TTL） */
+  warnings?: string | null;
+  created_at: string;
+  updated_at?: string;
+}
+
+/**
+ * AI 视频作业（M4-3）。
+ *
+ * 为什么不是"一个接口等到出片"：视频供应商是异步任务制，单条片段要轮询数分钟。
+ * 同步等会把前端连接和后端 worker 一起按住，还没法单独取消/重试某个镜头。
+ * 这里只负责提交作业，进度由页面每 5s 调 get 轮询。
+ */
+export const videoJobApi = {
+  /** 提交图生视频作业；image_url 传镜头当前首帧，空则退化为文生视频 */
+  create: (
+    projectId: string,
+    shotId: string,
+    data: { prompt?: string; duration?: number; image_url?: string } = {}
+  ) =>
+    api.post(
+      `/projects/${projectId}/shots/${shotId}/video-jobs`,
+      {
+        ...(data.prompt ? { prompt: data.prompt } : {}),
+        ...(data.duration != null ? { duration: data.duration } : {}),
+        ...(data.image_url ? { image_url: data.image_url } : {}),
+      },
+      // 只等"提交成功"（拿到 job_id），不等待出片；供应商提交本身可能慢，放宽到 120s
+      { timeout: 120000 }
+    ),
+  get: (projectId: string, jobId: string) =>
+    api.get(`/projects/${projectId}/video-jobs/${jobId}`),
+  list: (
+    projectId: string,
+    params?: { status?: VideoJobStatus; limit?: number }
+  ) => api.get(`/projects/${projectId}/video-jobs`, { params }),
+  cancel: (projectId: string, jobId: string) =>
+    api.post(`/projects/${projectId}/video-jobs/${jobId}/cancel`),
+};
+
+// ===== 场景资产 API（M4-3） =====
+
+/** 场景四视图的机位视角（不是角色的正/侧/背） */
+export type SceneView = "wide" | "medium" | "close" | "establishing";
+export type SceneAssetSource = "ai" | "upload";
+
+/** 后端 SceneAssetResponse（snake_case） */
+export interface SceneAssetDto {
+  id: string;
+  project_id?: string;
+  /** 场景标识：与镜头的 scene_ref 对齐（通常是 scenes.title） */
+  scene_ref: string;
+  view: SceneView;
+  url: string;
+  source: SceneAssetSource;
+  prompt?: string | null;
+  created_at?: string;
+}
+
+/**
+ * 场景资产（场景四视图复用池）。
+ *
+ * 一套场景只该有一种"长相"：同一间咖啡馆第一镜是木质暖光、第三镜变冷白水泥，
+ * 观众立刻出戏。四视图把场景固化，出首帧时按 scene_ref 注入参考图。
+ * 同一 (project, scene_ref, view) 只有一条，重新生成即覆盖。
+ */
+export const sceneAssetApi = {
+  list: (projectId: string, sceneRef?: string) =>
+    api.get(`/projects/${projectId}/scene-assets`, {
+      params: sceneRef ? { scene_ref: sceneRef } : undefined,
+    }),
+  /**
+   * 生成/上传某个视角。AI 出图会串行注入参考图，必须放宽超时；
+   * 同一视角重复调用是覆盖语义，所以 regenerate 无需额外参数。
+   */
+  create: (
+    projectId: string,
+    data: {
+      scene_ref: string;
+      view: SceneView;
+      source?: SceneAssetSource;
+      url?: string;
+      prompt?: string;
+    }
+  ) =>
+    api.post(`/projects/${projectId}/scene-assets`, data, {
+      timeout: 600000,
+    }),
+  remove: (projectId: string, assetId: string) =>
+    api.delete(`/projects/${projectId}/scene-assets/${assetId}`),
 };
 
 // ===== 角色 API =====
@@ -319,6 +502,13 @@ export interface ShotDto {
   character_refs: string[];
   /** 绑定的素材存储地址（canonical_url）；为空表示渲染时由 AI 生成 */
   video_url?: string | null;
+  /** 首帧图（M4-3，短期签名地址）；图生视频的入参，为空才退回纯文生视频 */
+  image_url?: string | null;
+  /**
+   * 喂给视频模型的提示词（M4-3）。与 description 分离：
+   * description 是给人看的运镜描述，video_prompt 是给模型的结构化描述。
+   */
+  video_prompt?: string | null;
   sort_order: number;
   created_at?: string;
 }

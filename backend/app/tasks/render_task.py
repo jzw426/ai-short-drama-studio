@@ -23,6 +23,7 @@ from app.core.time_utils import utc_now
 from app.models.asset import RenderTask
 from app.services.ai_service import AIUnavailableError
 from app.services.render_service import RenderCancelled, render_service
+from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
@@ -332,3 +333,15 @@ def execute_render(self, task_id: str):
             metrics.record_render_failure(category)
 
     asyncio.run(_run())
+
+
+def enqueue_render_task(task_id: str):
+    """路由层入队入口：显式绑定 celery_app。
+
+    与 enqueue_video_job 同因：路由在 asyncio.to_thread 里调用，子线程里 Celery
+    的 current_app 是默认 app，没有 broker_transport_options —— filesystem broker
+    下会去找相对路径 data_in/ 并抛 WinError 3。
+    """
+    return celery_app.send_task(
+        "app.tasks.render_task.execute_render", args=[str(task_id)]
+    )

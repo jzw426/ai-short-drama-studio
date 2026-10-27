@@ -55,6 +55,15 @@ class ImageCapabilityError(AIUnavailableError):
     """
 
 
+class VideoCapabilityError(AIUnavailableError):
+    """当前配置的视频 provider 不接受首帧图（图生视频的 image 入参）。
+
+    M4-3：图生视频是"镜头第一帧不崩"的唯一手段。provider 用 400/415/422 明确
+    拒绝 image 时必须报错，**绝不允许静默去掉 image 重试**——那会退化成纯文生
+    视频，用户以为首帧图生效了，实际每个镜头都是重新抽的随机画面。
+    """
+
+
 def _extract_token_usage(data) -> tuple:
     """从 OpenAI 兼容响应里取 token 用量；没有就返回 (0, 0)。"""
     if not isinstance(data, dict):
@@ -792,21 +801,54 @@ class AIService:
             "image", trace, _call, user_id=user_id, project_id=project_id
         )
 
-    # ==================== 视频生成（多 provider 路由，异步轮询） ====================
+    # ==================== 视频生成（多 provider 路由：提交 / 轮询分离，M4-3） ====================
+    #
+    # 为什么拆成 submit / poll 两步：provider 是异步任务制（POST /videos 拿 task_id，
+    # 之后 GET /videos/{id} 轮询）。旧实现把"提交 + 轮询 5 分钟"整个塞在渲染任务里，
+    # 一个 worker 被付费生成泡住、进度条卡死、失败无法单独重试、还取消不掉。
+    # 现在：API/Celery 只负责提交一次，轮询由 ai_video_jobs 作业按次推进（每次 5 秒）。
 
-    async def _video_generations(
+    # 时长（秒）→ num_frames：provider 要求 8n+1 且 <=441（不在表里按 5s 处理）
+    VIDEO_DURATION_TO_FRAMES = {3: 81, 5: 121, 7: 161, 10: 241, 15: 361, 18: 441}
+    VIDEO_FRAME_RATE = 24
+    # 兼容路径 generate_video 的同步轮询参数（渲染链路已不再调用它）
+    VIDEO_LEGACY_POLL_INTERVAL = 5.0
+    VIDEO_LEGACY_MAX_POLLS = 60
+
+    @staticmethod
+    def _num_frames_for_duration(duration: float) -> int:
+        try:
+            target = int(duration or 5)
+        except (TypeError, ValueError):
+            target = 5
+        return AIService.VIDEO_DURATION_TO_FRAMES.get(target, 121)
+
+    @staticmethod
+    def _video_provider_config(name: str) -> Optional[dict]:
+        """按名字取视频 provider 配置（轮询要跨进程续跑，只能靠名字找回配置）。"""
+        for provider in settings.AI_VIDEO_PROVIDERS:
+            if provider.get("name") == name:
+                return provider
+        return None
+
+    async def _submit_video_chain(
         self,
         prompt: str,
         image_url: Optional[str] = None,
         duration: float = 5.0,
         trace: Optional[dict] = None,
-    ) -> Optional[str]:
-        """
-        按 provider 链顺序生成视频片段（异步任务，轮询获取结果）。
-        当前实现：agnes（提交 /videos + 轮询任务状态）；
-        其他 provider 若配置但未实现，跳过并提示。
+    ) -> dict:
+        """按 provider 链提交视频任务，返回首个受理的作业（**不做记账**，由调用方包）。
+
+        返回 {"provider", "model", "task_id", "status"}。
+
+        能力语义：image_url 非空表示图生视频。provider 回 400/415/422 视作"不支持
+        image 入参"，记进 capability_errors 后试下一个（**绝不删掉 image 重试**）；
+        链上没有 provider 接受时抛 VideoCapabilityError。
         """
         client = await self._get_client()
+        capability_errors: List[str] = []
+        last_error: Optional[Exception] = None
 
         for provider in settings.AI_VIDEO_PROVIDERS:
             name = provider.get("name", "unknown")
@@ -814,30 +856,20 @@ class AIService:
             base = provider.get("base", "").rstrip("/")
             model = provider.get("model", "")
             if not api_key:
+                logger.info("[AI Router] video provider '%s' 未配置 API Key，跳过", name)
                 continue
             if name != "agnes":
                 logger.info("[AI Router] video provider '%s' 暂未实现，跳过", name)
                 continue
             if self._is_cooling("video", name):
+                logger.info("[AI Router] video provider '%s' 处于冷却期，跳过", name)
                 continue
 
-            # 根据时长选择合适的 num_frames（必须满足 8n+1 且 <=441）
-            duration_to_frames = {
-                3: 81,    # ~3.4s
-                5: 121,   # ~5.0s
-                7: 161,   # ~6.7s
-                10: 241,  # ~10.0s
-                15: 361,  # ~15.0s
-                18: 441,  # ~18.4s
-            }
-            target_sec = int(duration)
-            num_frames = duration_to_frames.get(target_sec, 121)
-
-            payload = {
+            payload: dict = {
                 "model": model,
                 "prompt": prompt,
-                "num_frames": num_frames,
-                "frame_rate": 24,
+                "num_frames": self._num_frames_for_duration(duration),
+                "frame_rate": self.VIDEO_FRAME_RATE,
             }
             if image_url:
                 payload["image"] = image_url
@@ -847,62 +879,204 @@ class AIService:
                 trace["model"] = model
 
             try:
-                # Step 1: 提交生成任务
-                submit_resp = await client.post(
+                response = await client.post(
                     f"{base}/videos",
                     headers=self._auth_headers(api_key),
                     json=payload,
                     timeout=httpx.Timeout(60.0),
                 )
-                submit_resp.raise_for_status()
-                task_data = submit_resp.json()
-                task_id = task_data.get("id") or task_data.get("task_id", "")
-
-                if not task_id:
-                    logger.warning("[AI Router] video provider '%s' submit failed: no task_id", name)
-                    continue
-
-                # Step 2: 轮询获取结果（最多等待 5 分钟）
-                for attempt in range(60):
-                    await asyncio.sleep(5)
-                    try:
-                        poll_resp = await client.get(
-                            f"{base}/videos/{task_id}",
-                            headers=self._auth_headers(api_key),
-                        )
-                        poll_resp.raise_for_status()
-                        poll_data = poll_resp.json()
-
-                        status = poll_data.get("status", "")
-                        if status == "completed":
-                            video_url = poll_data.get("remixed_from_video_id") or poll_data.get("video_url", "")
-                            if video_url and video_url.startswith("http"):
-                                self._report_success("video", name)
-                                logger.info("[AI Router] video provider '%s' 成功", name)
-                                return video_url
-                            self._report_failure("video", name)
-                            logger.warning("[AI Router] video provider '%s' completed but no valid URL", name)
-                            break
-                        elif status == "failed":
-                            self._report_failure("video", name)
-                            logger.warning("[AI Router] video provider '%s' task failed: %s", name, poll_data)
-                            break
-                        # else: still processing, continue polling
-                    except Exception as e:
-                        if trace is not None and _is_timeout_error(e):
-                            trace["timed_out"] = True
-                        continue
-
-                self._report_failure("video", name)
-                if trace is not None:
-                    trace["timed_out"] = True
-                logger.warning("[AI Router] video provider '%s' timed out", name)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - 网络错误换下一个 provider
+                last_error = e
                 if trace is not None and _is_timeout_error(e):
                     trace["timed_out"] = True
                 self._report_failure("video", name)
-                logger.warning("[AI Router] video provider '%s' 失败: %s，切换下一个", name, e)
+                logger.warning(
+                    "[AI Router] video provider '%s' 提交失败: %s，切换下一个", name, e
+                )
+                continue
 
+            if image_url and response.status_code in (400, 415, 422):
+                # 只可能是"不接受 image 入参"：不能去掉 image 重试（见类 docstring）
+                self._report_failure("video", name)
+                capability_errors.append(f"{name}: HTTP {response.status_code}")
+                logger.warning(
+                    "[AI Router] video provider '%s' 拒绝首帧图（HTTP %s），切换下一个",
+                    name, response.status_code,
+                )
+                continue
+
+            if response.status_code >= 400:
+                last_error = AIUnavailableError(
+                    f"{name} 提交视频任务失败: HTTP {response.status_code}"
+                )
+                self._report_failure("video", name)
+                logger.warning(
+                    "[AI Router] video provider '%s' 提交失败: HTTP %s，切换下一个",
+                    name, response.status_code,
+                )
+                continue
+
+            try:
+                data = response.json()
+            except Exception as e:  # noqa: BLE001 - 非法 JSON 等同于提交失败
+                last_error = AIUnavailableError(f"{name} 提交视频任务返回非 JSON: {e}")
+                self._report_failure("video", name)
+                logger.warning("[AI Router] video provider '%s' 返回非 JSON: %s", name, e)
+                continue
+
+            task_id = str(
+                (data or {}).get("id") or (data or {}).get("task_id") or ""
+            ).strip()
+            if not task_id:
+                last_error = AIUnavailableError(f"{name} 提交视频任务未返回 task_id")
+                self._report_failure("video", name)
+                logger.warning(
+                    "[AI Router] video provider '%s' submit failed: no task_id", name
+                )
+                continue
+
+            self._report_success("video", name)
+            logger.info(
+                "[AI Router] video provider '%s' 已受理（task=%s, model=%s）",
+                name, task_id, model,
+            )
+            return {
+                "provider": name,
+                "model": model,
+                "task_id": task_id,
+                "status": str((data or {}).get("status") or "submitted"),
+            }
+
+        if capability_errors and image_url:
+            raise VideoCapabilityError(
+                "没有可用的视频 provider 支持首帧图（图生视频 image 入参）："
+                + "；".join(capability_errors)
+                + "。请配置支持图生视频的 provider，或去掉首帧图改用纯文生视频。"
+            )
+        detail = f"（最近错误：{last_error}）" if last_error else ""
+        raise AIUnavailableError(f"所有视频 AI provider 均不可用，未提交视频任务{detail}")
+
+    async def submit_video(
+        self,
+        prompt: str,
+        image_url: Optional[str] = None,
+        duration: float = 5.0,
+        *,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> dict:
+        """提交一条视频生成任务并立刻返回（不等待出片），operation=video 记账。
+
+        返回 {"provider", "model", "task_id", "status"}，调用方把 task_id 落库后
+        由轮询任务继续推进。image_url 非空 = 图生视频，provider 不支持时抛
+        VideoCapabilityError（绝不静默退化成文生视频）。
+        """
+        trace: dict = {}
+
+        async def _call() -> dict:
+            return await self._submit_video_chain(
+                prompt, image_url, duration, trace=trace
+            )
+
+        return await self._traced_call(
+            "video", trace, _call, user_id=user_id, project_id=project_id
+        )
+
+    async def poll_video(self, provider: str, task_id: str) -> dict:
+        """查询一次视频任务状态（不等待、不记账）。
+
+        返回 {"status": "processing"|"completed"|"failed", "video_url": str|None,
+        "raw": dict}。provider 不在当前链里 / 查不到状态 / 网络失败一律抛
+        AIUnavailableError——把"查不到"当成"还在生成"会让作业无限轮询下去。
+        """
+        conf = self._video_provider_config(provider or "")
+        api_key = (conf or {}).get("api_key", "")
+        base = (conf or {}).get("base", "").rstrip("/")
+        if not conf or not api_key or not base:
+            raise AIUnavailableError(
+                f"视频 provider '{provider}' 不在当前配置链里，无法轮询任务 {task_id}"
+            )
+
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"{base}/videos/{task_id}",
+                headers=self._auth_headers(api_key),
+                timeout=httpx.Timeout(60.0),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:  # noqa: BLE001 - 统一成 AIUnavailableError 给作业层
+            raise AIUnavailableError(
+                f"轮询视频任务失败（{provider}/{task_id}）: {e}"
+            ) from e
+        if not isinstance(data, dict):
+            raise AIUnavailableError(
+                f"视频 provider '{provider}' 轮询返回的不是 JSON 对象: {str(data)[:200]}"
+            )
+
+        raw_status = str(data.get("status") or "").strip().lower()
+        if raw_status in ("completed", "succeeded", "success"):
+            video_url = str(
+                data.get("video_url") or data.get("remixed_from_video_id") or ""
+            ).strip()
+            if not (video_url.startswith("http://") or video_url.startswith("https://")):
+                # completed 却没有可下载地址：交给作业层按失败处理，别去转存空串
+                logger.warning(
+                    "[AI Router] video provider '%s' completed 但无有效视频地址: %s",
+                    provider, str(data)[:200],
+                )
+                video_url = ""
+            return {"status": "completed", "video_url": video_url or None, "raw": data}
+        if raw_status in ("failed", "error", "cancelled", "canceled"):
+            return {"status": "failed", "video_url": None, "raw": data}
+        return {"status": "processing", "video_url": None, "raw": data}
+
+    async def _video_generations(
+        self,
+        prompt: str,
+        image_url: Optional[str] = None,
+        duration: float = 5.0,
+        trace: Optional[dict] = None,
+    ) -> Optional[str]:
+        """兼容路径：提交 + 同步轮询到出片（返回 URL；全部失败返回 None）。
+
+        只被 generate_video 使用：这里走**非记账**的 _submit_video_chain，避免
+        一次逻辑调用被记两条账（外层 generate_video 的 _traced_call 已经记了）。
+        """
+        try:
+            submitted = await self._submit_video_chain(
+                prompt, image_url, duration, trace=trace
+            )
+        except VideoCapabilityError:
+            raise  # 能力缺失必须让调用方看见，不能返回 None 混过去
+        except AIUnavailableError as e:
+            logger.warning("[AI Router] 视频任务提交失败: %s", e)
+            return None
+
+        provider = submitted["provider"]
+        task_id = submitted["task_id"]
+        for _ in range(self.VIDEO_LEGACY_MAX_POLLS):
+            await asyncio.sleep(self.VIDEO_LEGACY_POLL_INTERVAL)
+            try:
+                polled = await self.poll_video(provider, task_id)
+            except AIUnavailableError as e:
+                # 单次查询失败不等于任务失败，继续等（旧实现同样 continue）
+                logger.warning("[AI Router] 轮询视频任务异常，继续重试: %s", e)
+                continue
+            if polled["status"] == "completed":
+                return polled["video_url"]
+            if polled["status"] == "failed":
+                logger.warning(
+                    "[AI Router] video provider '%s' 任务失败: %s",
+                    provider, str(polled.get("raw"))[:300],
+                )
+                break
+
+        if trace is not None:
+            trace["timed_out"] = True
+        self._report_failure("video", provider)
+        logger.warning("[AI Router] video provider '%s' 轮询超时，未出片", provider)
         return None
 
     async def generate_video(
@@ -914,7 +1088,12 @@ class AIService:
         user_id: Optional[str] = None,
         project_id: Optional[str] = None,
     ) -> Optional[str]:
-        """使用视频 provider 链生成视频片段（文生视频/图生视频）"""
+        """兼容/冒烟用：同步提交 + 轮询出片，返回视频 URL（失败返回 None）。
+
+        **渲染链路已不再调用它**（M4-3 起改走 ai_video_jobs 作业 + 轮询任务，
+        render_service 只消费已完成作业的产物或显式绑定的素材）。这里保留是为了
+        老测试/手工冒烟，签名与行为不变。
+        """
         trace: dict = {}
 
         async def _call() -> Optional[str]:
@@ -925,4 +1104,5 @@ class AIService:
         )
 
 
+# 全局单例
 ai_service = AIService()

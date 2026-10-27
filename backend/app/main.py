@@ -18,6 +18,8 @@ from app.api.routes import (
     auth,
     ops,
     media,
+    video_jobs,
+    scene_assets,
 )
 
 configure_logging()
@@ -94,5 +96,7 @@ app.include_router(storyboards.router, prefix="/api/v1", dependencies=[Depends(g
 app.include_router(characters.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 app.include_router(render.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 app.include_router(assets.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+app.include_router(video_jobs.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
+app.include_router(scene_assets.router, prefix="/api/v1", dependencies=[Depends(get_current_user)])
 # 媒体端点挂在根路径（/uploads/...），鉴权在端点内部完成（签名 或 登录+归属）
 app.include_router(media.router)

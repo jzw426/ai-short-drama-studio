@@ -139,9 +139,9 @@ async def submit_render_task(
     # 提交 Celery 异步任务，并保存真实 celery task id 供取消使用
     # 注意：broker 不可达时 delay() 可能长时间重试，必须加超时保护，避免接口被挂死
     try:
-        from app.tasks.render_task import execute_render
+        from app.tasks.render_task import enqueue_render_task
         celery_result = await asyncio.wait_for(
-            asyncio.to_thread(execute_render.delay, str(render_task.id)),
+            asyncio.to_thread(enqueue_render_task, str(render_task.id)),
             timeout=settings.CELERY_SUBMIT_TIMEOUT,
         )
         render_task.celery_task_id = str(celery_result.id)
